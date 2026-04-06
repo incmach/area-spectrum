@@ -308,46 +308,57 @@ def compute_gradient_reference(I, grad_output):
 # --- VERIFICATION ---
 
 if __name__ == "__main__":
-    #jitted = False
-    jitted = True
+    if True: # if args[1] == 'test'
+        jitted = False
+        #jitted = True
 
-    np.random.seed(42)
-    m = 64
-    for logn in range(6,11):
-        n = 2**logn
-        # Use 3x3 to keep the reference time reasonable
-        I = np.random.rand(m, n)
-        grad_output = np.random.rand(2 * m * n)
+        np.random.seed(42)
+        m = 64
+        for logn in range(6,11):
+            n = 2**logn
+            # Use 3x3 to keep the reference time reasonable
+            I = np.random.rand(m, n)
+            grad_output = np.random.rand(2 * m * n)
+            
+            print(f"Dimensions: {m}x{n} | Spectrum Bins: {2*m*n}")
+            print("Running calculations...")
+            sys.stdout.flush()
+
+            # 1. Forward Pass
+
+            start_ts = time.time()
+            f_fast = compute_area_spectrum(I)
+            if not jitted:
+                f_ref = compute_area_spectrum_reference(I)
+                err_f = np.linalg.norm(f_ref - f_fast) / np.linalg.norm(f_ref)
+                
+                print(f"Forward Match:  {'SUCCESS' if err_f < 1e-12 else 'FAILED'}")
+                print(f"  Relative Error: {err_f:.2e}")
+            else:
+                print(f"Forward-1: {time.time() - start_ts}")
+            sys.stdout.flush()
         
-        print(f"Dimensions: {m}x{n} | Spectrum Bins: {2*m*n}")
-        print("Running calculations...")
-        sys.stdout.flush()
+            # 2. Gradient Pass
+            start_ts = time.time()
+            g_fast = compute_gradient(I, grad_output)
+            if not jitted:
+                g_ref = compute_gradient_reference(I, grad_output)
+                err_g = np.linalg.norm(g_ref - g_fast) / np.linalg.norm(g_ref)
+                
+                print(f"Gradient Match: {'SUCCESS' if err_g < 1e-12 else 'FAILED'}")
+                print(f"  Relative Error: {err_g:.2e}")
+            else:
+                print(f"Gradient-1: {time.time() - start_ts}")
+            sys.stdout.flush()
 
-        # 1. Forward Pass
-
-        start_ts = time.time()
-        f_fast = compute_area_spectrum(I)
-        if not jitted:
-            f_ref = compute_area_spectrum_reference(I)
-            err_f = np.linalg.norm(f_ref - f_fast) / np.linalg.norm(f_ref)
-            
-            print(f"Forward Match:  {'SUCCESS' if err_f < 1e-12 else 'FAILED'}")
-            print(f"  Relative Error: {err_f:.2e}")
-        else:
-            print(f"Forward-1: {time.time() - start_ts}")
-        sys.stdout.flush()
-    
-        # 2. Gradient Pass
-        start_ts = time.time()
-        g_fast = compute_gradient(I, grad_output)
-        if not jitted:
-            g_ref = compute_gradient_reference(I, grad_output)
-            err_g = np.linalg.norm(g_ref - g_fast) / np.linalg.norm(g_ref)
-            
-            print(f"Gradient Match: {'SUCCESS' if err_g < 1e-12 else 'FAILED'}")
-            print(f"  Relative Error: {err_g:.2e}")
-        else:
-            print(f"Gradient-1: {time.time() - start_ts}")
-        sys.stdout.flush()
-
-        jitted = True
+            jitted = True
+    else:
+        # o. cv2.imread(args[1])
+        # o. cv2.imshow()
+        # o. compute_area_spectrum
+        # o. cv2.imshow() spectrum reshaped as (m-1)*(n-1)
+        # o. handle mouse wheel events on spectrum image
+        # o. on a roll change the target value accordingly
+        # o. on a click, do gradient descent starting at spatial
+        # o. show the resulting image and the resulting spectrum
+        pass 
