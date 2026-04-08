@@ -1,14 +1,17 @@
 import time
 import numpy as np
+import cv2
 from scipy.fft import fft, fft2, ifft, ifft2
 from scipy.ndimage import rotate
 from numba import njit, prange, get_num_threads, get_thread_id
 import sys
+import argparse
+import math
 
 # --- FAST NUMBA-ACCELERATED METHODS (O(N * m^2)) ---
 
 @njit(parallel=True, fastmath=True)
-def _fast_spectrum_kernel_optimized(alpha, m, N):
+def _spectrum_kernel(alpha, m, N):
     # 1. Symmetry: Only need to compute half + 1 bins
     N_half = N // 2 + 1
     hat_f_half = np.zeros(N_half, dtype=np.complex128)
@@ -90,70 +93,17 @@ def _fast_spectrum_kernel_optimized(alpha, m, N):
 
     return hat_f
 
-@njit(parallel=True, fastmath=False)
-def _fast_spectrum_kernel(alpha, m, N):
-    hat_f = np.zeros(N, dtype=np.complex128)
-
-    shift = m // 2 + 1
-    side = m + shift + 1 
-    
-    total_elements = m * (2 * m - 1)
-    buf_size = (total_elements + 1) // 2 
-    
-    split_maps = [np.zeros(buf_size, dtype=np.int32), np.zeros(buf_size, dtype=np.int32)]
-    merge_maps = [np.zeros_like(split_maps[0]), np.zeros_like(split_maps[1])]
-
-    for c in prange(1-m, m):
-        for r in range(m):
-            hs = (r + c) // 2 + shift
-            hd = (r - c) // 2 + shift
-            
-            map_idx = (r + c) % 2
-            idx = r * (2 * m - 1) + (c + m - 1)
-            
-            split_maps[map_idx][idx // 2] = hs * side + hd
-            merge_maps[map_idx][idx // 2] = hd * side + hs # Transpose extraction
-        
-    for k in prange(N):
-        subalpha = np.zeros((m, 2 * m - 1), dtype=np.complex128)
-        for c in range(1-m, m):
-            subalpha[:, c + m - 1] = alpha[:, (k * c) % N]
-            
-        merged_beta_ks_squared = np.zeros_like(subalpha)
-        beta_k = np.zeros((side, side), dtype=np.complex128)
-        
-        for offset in range(2):
-            if offset > 0:
-                beta_k[:, :] = 0
-            
-            map_idx = (m - 1 + offset) % 2
-            source_vals = np.ravel(subalpha)[offset::2]
-            count = source_vals.size
-            
-            # Populate matrix
-            np.ravel(beta_k)[split_maps[map_idx][:count]] = source_vals
-            
-            # Standard matrix squaring
-            beta_k_sq = beta_k @ beta_k
-            
-            # Extract summed products
-            np.ravel(merged_beta_ks_squared)[offset::2] = np.ravel(beta_k_sq)[merge_maps[map_idx][:count]]
-
-        hat_f[k] = np.sum(subalpha * merged_beta_ks_squared)
-
-    return hat_f
-
 def compute_area_spectrum(I):
     m, n = I.shape
     N = 2 * m * n
     # Standard Forward FFT (raw sum with exp(-j...))
     alpha = fft(I.astype(np.float64), n=N, axis=1)
-    hat_f = _fast_spectrum_kernel_optimized(alpha, m, N)
+    hat_f = _spectrum_kernel(alpha, m, N)
     # The raw spatial sum is exactly the Inverse DFT of the frequency-domain products
     return ifft(hat_f).real
 
 @njit(parallel=True, fastmath=True)
-def _fast_gradient_kernel_optimized(alpha, hat_G, m, N):
+def _gradient_kernel(alpha, hat_G, m, N):
     # 1. Setup dimensions and symmetry
     N_half = N // 2 + 1
     num_threads = get_num_threads()
@@ -241,32 +191,13 @@ def _fast_gradient_kernel_optimized(alpha, hat_G, m, N):
 
     return final_grad_alpha
 
-@njit(parallel=True, fastmath=False)
-def _fast_gradient_kernel(alpha, hat_G, m, N):
-    # We parallelize over y to avoid race conditions on the target_freq bins
-    grad_alpha = np.zeros(alpha.shape, dtype=np.complex128)
-
-    for y in prange(m):
-        for k in range(N):
-            # We need the conjugate of hat_G for the backprop chain rule
-            gk_conj = np.conj(hat_G[k])
-            if abs(gk_conj) < 1e-15:
-                continue
-            for y1 in range(m):
-                for y2 in range(m):
-                    # Pivot is row y. Target freq in FFT space is k*(y1-y2)
-                    target_freq = (k * (y1 - y2)) % N
-                    val = 3.0 * gk_conj * alpha[y1, (y2-y)*k%N] * alpha[y2, (y-y1)*k%N]
-                    grad_alpha[y, target_freq] += val
-    return grad_alpha
-
 def compute_gradient(I, grad_output):
     m, n = I.shape
     N = 2 * m * n
     alpha = fft(I.astype(np.float64), n=N, axis=1)
     hat_G = fft(grad_output.astype(np.complex128))
     
-    grad_alpha = _fast_gradient_kernel_optimized(alpha, hat_G, m, N)
+    grad_alpha = _gradient_kernel(alpha, hat_G, m, N)
     # Backprop through Row-FFT requires the Forward FFT divided by N
     return fft(grad_alpha, axis=1).real[:, :n] / N
 
@@ -307,58 +238,95 @@ def compute_gradient_reference(I, grad_output):
 
 # --- VERIFICATION ---
 
-if __name__ == "__main__":
-    if True: # if args[1] == 'test'
-        jitted = False
-        #jitted = True
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == '--test':
+    jitted = False
+    #jitted = True
 
-        np.random.seed(42)
-        m = 64
-        for logn in range(6,11):
-            n = 2**logn
-            # Use 3x3 to keep the reference time reasonable
-            I = np.random.rand(m, n)
-            grad_output = np.random.rand(2 * m * n)
-            
-            print(f"Dimensions: {m}x{n} | Spectrum Bins: {2*m*n}")
-            print("Running calculations...")
-            sys.stdout.flush()
-
-            # 1. Forward Pass
-
-            start_ts = time.time()
-            f_fast = compute_area_spectrum(I)
-            if not jitted:
-                f_ref = compute_area_spectrum_reference(I)
-                err_f = np.linalg.norm(f_ref - f_fast) / np.linalg.norm(f_ref)
-                
-                print(f"Forward Match:  {'SUCCESS' if err_f < 1e-12 else 'FAILED'}")
-                print(f"  Relative Error: {err_f:.2e}")
-            else:
-                print(f"Forward-1: {time.time() - start_ts}")
-            sys.stdout.flush()
+    np.random.seed(42)
+    m = 16
+    for logn in range(6,11):
+        n = 2**logn
+        # Use 3x3 to keep the reference time reasonable
+        I = np.random.rand(m, n)
+        grad_output = np.random.rand(2 * m * n)
         
-            # 2. Gradient Pass
-            start_ts = time.time()
-            g_fast = compute_gradient(I, grad_output)
-            if not jitted:
-                g_ref = compute_gradient_reference(I, grad_output)
-                err_g = np.linalg.norm(g_ref - g_fast) / np.linalg.norm(g_ref)
-                
-                print(f"Gradient Match: {'SUCCESS' if err_g < 1e-12 else 'FAILED'}")
-                print(f"  Relative Error: {err_g:.2e}")
-            else:
-                print(f"Gradient-1: {time.time() - start_ts}")
-            sys.stdout.flush()
+        print(f"Dimensions: {m}x{n} | Spectrum Bins: {2*m*n}")
+        print("Running calculations...")
+        sys.stdout.flush()
 
-            jitted = True
-    else:
-        # o. cv2.imread(args[1])
-        # o. cv2.imshow()
-        # o. compute_area_spectrum
-        # o. cv2.imshow() spectrum reshaped as (m-1)*(n-1)
-        # o. handle mouse wheel events on spectrum image
-        # o. on a roll change the target value accordingly
-        # o. on a click, do gradient descent starting at spatial
-        # o. show the resulting image and the resulting spectrum
-        pass 
+        # 1. Forward Pass
+
+        start_ts = time.time()
+        f_fast = compute_area_spectrum(I)
+        if not jitted:
+            f_ref = compute_area_spectrum_reference(I)
+            err_f = np.linalg.norm(f_ref - f_fast) / np.linalg.norm(f_ref)
+            
+            print(f"Forward Match:  {'SUCCESS' if err_f < 1e-12 else 'FAILED'}")
+            print(f"  Relative Error: {err_f:.2e}")
+        else:
+            print(f"Forward-1: {time.time() - start_ts}")
+        sys.stdout.flush()
+    
+        # 2. Gradient Pass
+        start_ts = time.time()
+        g_fast = compute_gradient(I, grad_output)
+        if not jitted:
+            g_ref = compute_gradient_reference(I, grad_output)
+            err_g = np.linalg.norm(g_ref - g_fast) / np.linalg.norm(g_ref)
+            
+            print(f"Gradient Match: {'SUCCESS' if err_g < 1e-12 else 'FAILED'}")
+            print(f"  Relative Error: {err_g:.2e}")
+        else:
+            print(f"Gradient-1: {time.time() - start_ts}")
+        sys.stdout.flush()
+
+        jitted = True
+elif __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Interactive 1D DFT editing of an image.")
+    parser.add_argument("image", help="Path to the input image (grayscale).")
+    parser.add_argument("voffset", help="Subimage vertical offset")
+    parser.add_argument("height", help="Subimage height")
+
+    args = parser.parse_args()
+
+    # Load image as 8-bit grayscale
+    img = cv2.imread(args.image, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        print("Error: Could not load image.")
+        exit()
+
+    voffset = int(args.voffset)
+    height = int(args.height)
+    
+    img = img[voffset:voffset+height,:].copy()
+
+    cv2.imshow("Image", img)
+
+    as_img = compute_area_spectrum(img)
+    as_img = as_img[:math.prod(img.shape)].reshape(*img.shape)
+    print(len(np.unique(as_img)))
+    as_img = cv2.normalize(as_img, None, 0.0001, 0.9999, cv2.NORM_MINMAX)
+    print(len(np.unique(as_img)))
+    as_img = np.where(as_img < 0.001, 1000*as_img, 1)
+    as_img = cv2.normalize(as_img, None, 0, 255, cv2.NORM_MINMAX)
+
+    cv2.imshow("Area spectrum", as_img)
+
+    # Main loop
+    while True:
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == 27:   # 'q' or ESC
+            break
+
+    cv2.destroyAllWindows()
+
+    # o. cv2.imread(args[1])
+    # o. cv2.imshow()
+    # o. compute_area_spectrum
+    # o. cv2.imshow() spectrum reshaped as (m-1)*(n-1)
+    # o. handle mouse wheel events on spectrum image
+    # o. on a roll change the target value accordingly
+    # o. on a click, do gradient descent starting at spatial
+    # o. show the resulting image and the resulting spectrum
+    pass 
