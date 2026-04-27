@@ -1,16 +1,38 @@
-import itertools
+import itertools as it
 import math
 import time
 
 import numpy as np
 import galois
 
+TEST = True
+
+#TODO a couple of tests for it
+#TODO joblib
+def compute_spectrum_naive(I):
+    result = 2*math.prod(I.shape)*[0]
+    for vs in it.product(it.product(*[range(n) for n in I.shape]), repeat = len(I.shape) + 1):
+        signed_area = int(np.round(np.linalg.det(
+            [ [ vs[i+1][j] - vs[0][j] for j in range(len(I.shape)) ] for i in range(len(I.shape)) ])))
+        result[signed_area] += math.prod(int(I[v]) for v in vs)
+    for i, v in enumerate(result):
+        result[i] = v//3
+    print(result)
+    return result[:math.prod(I.shape)]
+        
+if TEST:
+    assert(compute_spectrum_naive(np.zeros((0, 0), dtype = np.uint8)) == [ ])
+    assert(len(compute_spectrum_naive(np.zeros((1, 1), dtype = np.uint8))) == 1)
+    assert(len(compute_spectrum_naive(np.ones((1, 1), dtype = np.uint8))) == 1)
+    assert(compute_spectrum_naive(np.ones((1, 2), dtype = np.uint8))[1:] == [ 0 ])
+    assert(compute_spectrum_naive(np.ones((2, 1), dtype = np.uint8))[1:] == [ 0 ])
+    assert(compute_spectrum_naive(np.ones((2, 2), dtype = np.uint8))[1:] == [ 4, 0, 0 ])
+    assert(compute_spectrum_naive(np.ones((3, 3), dtype = np.uint8))[1:3] == [ 32, 32, 4, 8, 0, 0, 0, 0, 0 ])
 def compute_max_spectrum(image_shape, spectrum_size, max_pixel_value):
     m, n = image_shape
     I = np.ones(image_shape, dtype = np.uint8)
     N = 2*spectrum_size
     S = np.zeros((N,), dtype = np.uint64)
-    # this only works for reference, for max spectrum we should just take a sufficiently large prime
     for y1, x1, y2, x2, y3, x3 in itertools.product(range(m), range(n), repeat = 3):
         if y2 == x2 == x3 == y3 == 0:
             print(f'{x1}x{y1}')
@@ -19,7 +41,7 @@ def compute_max_spectrum(image_shape, spectrum_size, max_pixel_value):
     S *= max_pixel_value**3
     return S
  
-if __name__ == "__main__":
+if __name__ == "__main__" and not TEST:
     image_shape = (16, 32)
     spectrum_size = math.prod(image_shape)
     max_pixel_value = 255
@@ -50,3 +72,4 @@ if __name__ == "__main__":
     print(AS)
 
     print(f'done');
+
