@@ -17,7 +17,6 @@ def compute_spectrum_naive(I):
         result[signed_area] += math.prod(int(I[v]) for v in vs)
     for i, v in enumerate(result):
         result[i] = v//3
-    print(result)
     return result[:math.prod(I.shape)]
         
 if TEST:
@@ -27,7 +26,24 @@ if TEST:
     assert(compute_spectrum_naive(np.ones((1, 2), dtype = np.uint8))[1:] == [ 0 ])
     assert(compute_spectrum_naive(np.ones((2, 1), dtype = np.uint8))[1:] == [ 0 ])
     assert(compute_spectrum_naive(np.ones((2, 2), dtype = np.uint8))[1:] == [ 4, 0, 0 ])
-    assert(compute_spectrum_naive(np.ones((3, 3), dtype = np.uint8))[1:3] == [ 32, 32, 4, 8, 0, 0, 0, 0, 0 ])
+    assert(compute_spectrum_naive(np.ones((3, 3), dtype = np.uint8))[1:] == [ 32, 32, 4, 8, 0, 0, 0, 0 ])
+    stretched_as = compute_spectrum_naive(np.array([
+        [      0,  32601,      0,     15,      0,      3,      0,       4,      0],
+        [      5,      0,      6,      0,      7,      0,     17,       0,      9],
+        [      0,     10,      0,     11,      0,     12,      0,      13,      0],
+        [     14,      0,     15,      0,     16,      0,     19,       0,2**32+1] ], dtype=np.uint64))
+    
+    unstretched_as = compute_spectrum_naive(np.array([
+        [      0,      5,  32601,      0,      0,      0],
+        [     14,     10,      6,     15,      0,      0],
+        [      0,     15,     11,      7,      3,      0],
+        [      0,      0,     16,     12,     17,      4],
+        [      0,      0,      0,     19,     13,      9],
+        [      0,      0,      0,      0,2**32+1,      0]], dtype=np.uint64))
+    print(stretched_as[::2])
+    print(unstretched_as)
+    assert(stretched_as[::2] == unstretched_as[:len(stretched_as)//2])
+    assert(unstretched_as[len(stretched_as)//2:] == (len(unstretched_as)-len(stretched_as)//2)*[0])
 def compute_max_spectrum(image_shape, spectrum_size, max_pixel_value):
     m, n = image_shape
     I = np.ones(image_shape, dtype = np.uint8)
