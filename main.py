@@ -8,6 +8,9 @@ import galois
 
 TEST = True
 
+def recompute_area_spectrum_at_zero(I, spectrum):
+    spectrum[0] = math.comb(sum(sum(int(v) for v in row) for row in I), 3) - sum(spectrum[1:])
+
 #TODO joblib
 def compute_spectrum_naive(I):
     result = 2*math.prod(I.shape)*[int(0)]
@@ -21,11 +24,7 @@ def compute_spectrum_naive(I):
         result[i] = v//3
     if result:
         result = result[:math.prod(I.shape)]
-        result[0] = math.comb(sum(sum(int(v) for v in row) for row in I), 3) - sum(result[1:])
-    *_, gcd = it.accumulate(result[1:], galois.gcd, initial = 0)
-    if gcd > 0:
-        print(gcd)
-        print([v//gcd for v in result])
+        recompute_area_spectrum_at_zero(I, result)
     return result
         
 if TEST:
@@ -66,32 +65,35 @@ def compute_max_spectrum(image_shape, max_pixel_value):
 if TEST: 
     assert(compute_max_spectrum((4,4), 255)[1:] == compute_spectrum_naive(255*np.ones((4,4), dtype=np.uint8))[1:])
 
-def compute_area_spectrum_ntt_simple(I, p):
+def compute_area_spectrum_ntt_simple(I, p = None):
     # 1. Compute ntt per row
     spectrum_size = math.prod(I.shape)
     double_spectrum_size = 2*spectrum_size
+    if p is None:
+        p = math.comb(sum(int(v) for row in I for v in row), 3)
     while True:
         p = galois.next_prime(p)
-        if (p-1)%(2*spectrum_size)== 0:
+        if (p-1)%double_spectrum_size == 0:
             break 
         p += 1
+    print(p)
     GF = galois.GF(p)
     rows = I.shape[0]
-    NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ]).T
-    NTT_R = GF(np.zeros(double_spectrum_size, dtype=np.uint8))
+    NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
+    NTT_R = GF(double_spectrum_size*[0])
     for ys in it.product(range(rows), repeat = 3):
-        if ys[1] == ys[2] == 0:
-            print(f'starting {ys[0]}')
         complement = [
-                NTT_I[ [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%(spectrum_size*2) for k in range(double_spectrum_size) ], y_i ]
+                NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
                 for y_i in range(3)
             ]
-        NTT_R += GF(1)/GF(3)*math.prod(complement)
-    return [ int(v) for v in galois.intt(NTT_R)[:spectrum_size] ]
+        NTT_R += math.prod(complement)
+    result = [ int(v) for v in galois.intt(NTT_R)[:spectrum_size]/GF(3) ]
+    recompute_area_spectrum_at_zero(I, result)
+    return result
 
 if TEST:
-    I = np.random.randint(0, 16, size = (5,5), dtype = np.uint8)
+    np.random.seed(38)
+    I = np.random.randint(0, 16, size = (5,6), dtype = np.uint8)
     reference = compute_spectrum_naive(I)
-    print(reference)
-    computed = compute_area_spectrum_ntt_simple(I, max(reference[1:])+1)
-    print(computed)
+    assert(reference == compute_area_spectrum_ntt_simple(I))
+    assert(reference == compute_area_spectrum_ntt_simple(I, max(reference[1:])))
