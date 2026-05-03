@@ -76,10 +76,15 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
         NTT_R += math.prod(complement)
     return NTT_R
 
+#TODO y_1 <= y_2 <= y_3
+#TODO parallelize
+#TODO memoize (some of) 
 def aggregate_area_spectrum_ntt_per_diff_pairs(NTT_I):
     NTT_I_T = NTT_I.T
     rows, double_spectrum_size = NTT_I.shape
     NTT_R = np.zeros_like(NTT_I[0])
+
+    log = dict()
 
     for d_12 in range(-(rows-1), rows):
         factors_3 = NTT_I_T[ [k*d_12%double_spectrum_size for k in range(double_spectrum_size) ], : ]
@@ -91,6 +96,14 @@ def aggregate_area_spectrum_ntt_per_diff_pairs(NTT_I):
             NTT_R += np.sum(
                     factors_1[:,y_min:y_max]*factors_2[:,y_min-d_12:y_max-d_12]*factors_3[:,y_min-d_12-d_23:y_max-d_12-d_23],
                    axis = 1)
+
+            for k in range(double_spectrum_size):
+                key = tuple(sorted([k*d_12%double_spectrum_size,k*d_23%double_spectrum_size,k*(-d_12-d_23)%double_spectrum_size]))
+                if key not in log:
+                    log[key] = 0
+                log[key] += 1
+
+    print(sorted((log[k], k) for k in log))
 
     return NTT_R
 
