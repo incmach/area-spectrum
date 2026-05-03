@@ -77,19 +77,20 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
     return NTT_R
 
 def aggregate_area_spectrum_ntt_per_diff_pairs(NTT_I):
+    NTT_I_T = NTT_I.T
     rows, double_spectrum_size = NTT_I.shape
     NTT_R = np.zeros_like(NTT_I[0])
 
     for d_12 in range(-(rows-1), rows):
-        factors_3 = NTT_I[ :, [k*d_12%double_spectrum_size for k in range(double_spectrum_size) ]]
+        factors_3 = NTT_I_T[ [k*d_12%double_spectrum_size for k in range(double_spectrum_size) ], : ]
         for d_23 in range(-(rows-1) - min(0, d_12), rows - max(0, d_12)):
-            factors_1 = NTT_I[ :, [k*d_23%double_spectrum_size for k in range(double_spectrum_size) ]]
-            factors_2 = NTT_I[ :, [k*(-d_12-d_23)%double_spectrum_size for k in range(double_spectrum_size) ]]
+            factors_1 = NTT_I_T[ [k*d_23%double_spectrum_size for k in range(double_spectrum_size) ], : ]
+            factors_2 = NTT_I_T[ [k*(-d_12-d_23)%double_spectrum_size for k in range(double_spectrum_size) ], : ]
             y_min = max(d_12, d_12+d_23, 0)
             y_max = rows + min(d_12, d_12+d_23, 0)
             NTT_R += np.sum(
-                   factors_1[y_min:y_max]*factors_2[y_min-d_12:y_max-d_12]*factors_3[y_min-d_12-d_23:y_max-d_12-d_23],
-                   axis = 0)
+                    factors_1[:,y_min:y_max]*factors_2[:,y_min-d_12:y_max-d_12]*factors_3[:,y_min-d_12-d_23:y_max-d_12-d_23],
+                   axis = 1)
 
     return NTT_R
 
@@ -115,7 +116,7 @@ def compute_area_spectrum_ntt_simple(I, p = None):
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (5,8), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (5,16), dtype = np.uint8)
     start = time.time()
     reference = compute_spectrum_naive(I)
     print(time.time() - start)
