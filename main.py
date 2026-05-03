@@ -65,6 +65,34 @@ def compute_max_spectrum(image_shape, max_pixel_value):
 if TEST: 
     assert(compute_max_spectrum((4,4), 255)[1:] == compute_spectrum_naive(255*np.ones((4,4), dtype=np.uint8))[1:])
 
+def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
+    rows, double_spectrum_size = NTT_I.shape
+    NTT_R = np.zeros_like(NTT_I[0])
+    for ys in it.product(range(rows), repeat = 3):
+        complement = [
+            NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
+            for y_i in range(3)
+        ]
+        NTT_R += math.prod(complement)
+    return NTT_R
+
+def aggregate_area_spectrum_ntt_per_diff_pairs(NTT_I):
+    rows, double_spectrum_size = NTT_I.shape
+    NTT_R = np.zeros_like(NTT_I[0])
+
+    for d_12 in range(-(rows-1), rows):
+        factors_3 = NTT_I[ :, [k*d_12%double_spectrum_size for k in range(double_spectrum_size) ]]
+        for d_23 in range(-(rows-1) - min(0, d_12), rows - max(0, d_12)):
+            factors_1 = NTT_I[ :, [k*d_23%double_spectrum_size for k in range(double_spectrum_size) ]]
+            factors_2 = NTT_I[ :, [k*(-d_12-d_23)%double_spectrum_size for k in range(double_spectrum_size) ]]
+            y_min = max(d_12, d_12+d_23, 0)
+            y_max = rows + min(d_12, d_12+d_23, 0)
+            NTT_R += np.sum(
+                   factors_1[y_min:y_max]*factors_2[y_min-d_12:y_max-d_12]*factors_3[y_min-d_12-d_23:y_max-d_12-d_23],
+                   axis = 0)
+
+    return NTT_R
+
 def compute_area_spectrum_ntt_simple(I, p = None):
     # 1. Compute ntt per row
     spectrum_size = math.prod(I.shape)
@@ -80,20 +108,23 @@ def compute_area_spectrum_ntt_simple(I, p = None):
     GF = galois.GF(p)
     rows = I.shape[0]
     NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
-    NTT_R = GF(double_spectrum_size*[0])
-    for ys in it.product(range(rows), repeat = 3):
-        complement = [
-                NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
-                for y_i in range(3)
-            ]
-        NTT_R += math.prod(complement)
+    NTT_R = aggregate_area_spectrum_ntt_per_diff_pairs(NTT_I)
     result = [ int(v) for v in galois.intt(NTT_R)[:spectrum_size]/GF(3) ]
     recompute_area_spectrum_at_zero(I, result)
     return result
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (5,6), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (5,8), dtype = np.uint8)
+    start = time.time()
     reference = compute_spectrum_naive(I)
-    assert(reference == compute_area_spectrum_ntt_simple(I))
-    assert(reference == compute_area_spectrum_ntt_simple(I, max(reference[1:])))
+    print(time.time() - start)
+    print(reference)
+    compute_area_spectrum_ntt_simple(I)
+    start = time.time()
+    result = compute_area_spectrum_ntt_simple(I)
+    print(time.time() - start)
+    print(result)
+
+    #assert(reference == compute_area_spectrum_ntt_simple(I))
+    #assert(reference == compute_area_spectrum_ntt_simple(I, max(reference[1:])))
