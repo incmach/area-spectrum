@@ -99,8 +99,7 @@ def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
                     NTT_R += reverse_summand
     return NTT_R
 
-#TODO y_1 <= y_2 <= y_3
-def aggregate_area_spectrum_ntt_per_diff_ordered_pairs(NTT_I):
+def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
     NTT_I_T = NTT_I.T
     rows, double_spectrum_size = NTT_I.shape
     NTT_R = np.zeros_like(NTT_I[0])
@@ -112,9 +111,15 @@ def aggregate_area_spectrum_ntt_per_diff_ordered_pairs(NTT_I):
             factors_2 = NTT_I_T[ [k*(-d_12-d_23)%double_spectrum_size for k in range(double_spectrum_size) ], : ]
             y_min = 0
             y_max = rows+d_12+d_23
-            NTT_R += np.sum(
+            summand = 3*np.sum(
                 factors_1[:,y_min:y_max]*factors_2[:,y_min-d_12:y_max-d_12]*factors_3[:,y_min-d_12-d_23:y_max-d_12-d_23],
                 axis = 1)
+            NTT_R += summand
+            if d_12 != 0 and d_23 != 0:
+                reverse_summand = np.zeros_like(summand)
+                reverse_summand[0] = summand[0]
+                reverse_summand[1:] = np.flip(summand[1:])
+                NTT_R += reverse_summand
 
     return NTT_R
 
@@ -139,8 +144,7 @@ def aggregate_area_spectrum_ntt_per_diff_pairs(NTT_I):
 
     return NTT_R
 
-def compute_area_spectrum_ntt_simple(I, p = None):
-    # 1. Compute ntt per row
+def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None):
     spectrum_size = math.prod(I.shape)
     double_spectrum_size = 2*spectrum_size
     if p is None:
@@ -153,24 +157,33 @@ def compute_area_spectrum_ntt_simple(I, p = None):
     GF = galois.GF(p)
     rows = I.shape[0]
     NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
-    NTT_R = aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I)
+    NTT_R = aggregator(NTT_I)
     result = [ int(v) for v in galois.intt(NTT_R)[:spectrum_size]/GF(3) ]
     recompute_area_spectrum_at_zero(I, result)
     return result
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (4,3), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (8,16), dtype = np.uint8)
     start = time.time()
     reference = compute_spectrum_naive(I)
     print(time.time() - start)
     print(reference)
+    
     compute_area_spectrum_ntt_simple(I)
     print()
     start = time.time()
     result = compute_area_spectrum_ntt_simple(I)
     print(time.time() - start)
     print(result)
+
+    compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_row_triplets)
+    print()
+    start = time.time()
+    result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_row_triplets)
+    print(time.time() - start)
+    print(result)
+
 
     #assert(reference == compute_area_spectrum_ntt_simple(I))
     #assert(reference == compute_area_spectrum_ntt_simple(I, max(reference[1:])))
