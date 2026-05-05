@@ -82,41 +82,21 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
 def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
     NTT_R = np.zeros_like(NTT_I[0])
-    for y_1 in range(rows-2):
-        for y_2 in range(y_1+1, rows-1):
-            for y_3 in range(y_2+1, rows):
+    for y_1 in range(rows):
+        for y_2 in range(y_1, rows):
+            for y_3 in range(y_2, rows):
                 ys = [ y_1, y_2, y_3 ]
                 complement = [
                     NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
                     for y_i in range(3)
                 ]
                 summand = 3*math.prod(complement)
-                reverse_summand = np.zeros_like(summand)
-                reverse_summand[0] = summand[0]
-                for i in range(1, double_spectrum_size):
-                    reverse_summand[double_spectrum_size-i] = summand[i]
                 NTT_R += summand
-                NTT_R += reverse_summand
-    for y_1_2 in range(rows-1):
-        for y_3 in range(y_1_2+1,rows):
-            ys = [ y_1_2, y_1_2, y_3 ]
-            complement = [
-                NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
-                for y_i in range(3)
-            ]
-            summand = 3*math.prod(complement)
-            NTT_R += summand
-
-    for y_1 in range(rows-1):
-        for y_2_3 in range(y_1+1, rows):
-            ys = [ y_1, y_2_3, y_2_3 ]
-            complement = [
-                NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
-                for y_i in range(3)
-            ]
-            summand = 3*math.prod(complement)
-            NTT_R += summand
-
+                if y_1 < y_2 < y_3:
+                    reverse_summand = np.zeros_like(summand)
+                    reverse_summand[0] = summand[0]
+                    reverse_summand[1:] = np.flip(summand[1:])
+                    NTT_R += reverse_summand
     return NTT_R
 
 #TODO y_1 <= y_2 <= y_3
@@ -186,8 +166,8 @@ if TEST:
     print(time.time() - start)
     print(reference)
     compute_area_spectrum_ntt_simple(I)
-    start = time.time()
     print()
+    start = time.time()
     result = compute_area_spectrum_ntt_simple(I)
     print(time.time() - start)
     print(result)
