@@ -73,18 +73,78 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
             NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
             for y_i in range(3)
         ]
+        summand = math.prod(complement)
+        if set(ys) == {0,1,3}:
+            print(f'{ys}: {summand}')
         NTT_R += math.prod(complement)
     return NTT_R
 
+def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
+    rows, double_spectrum_size = NTT_I.shape
+    NTT_R = np.zeros_like(NTT_I[0])
+    for y_1 in range(rows-2):
+        for y_2 in range(y_1+1, rows-1):
+            for y_3 in range(y_2+1, rows):
+                ys = [ y_1, y_2, y_3 ]
+                complement = [
+                    NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
+                    for y_i in range(3)
+                ]
+                summand = 3*math.prod(complement)
+                reverse_summand = np.zeros_like(summand)
+                reverse_summand[0] = summand[0]
+                for i in range(1, double_spectrum_size):
+                    reverse_summand[double_spectrum_size-i] = summand[i]
+                NTT_R += summand
+                NTT_R += reverse_summand
+    for y_1_2 in range(rows-1):
+        for y_3 in range(y_1_2+1,rows):
+            ys = [ y_1_2, y_1_2, y_3 ]
+            complement = [
+                NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
+                for y_i in range(3)
+            ]
+            summand = 3*math.prod(complement)
+            NTT_R += summand
+
+    for y_1 in range(rows-1):
+        for y_2_3 in range(y_1+1, rows):
+            ys = [ y_1, y_2_3, y_2_3 ]
+            complement = [
+                NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
+                for y_i in range(3)
+            ]
+            summand = 3*math.prod(complement)
+            NTT_R += summand
+
+    return NTT_R
+
 #TODO y_1 <= y_2 <= y_3
+def aggregate_area_spectrum_ntt_per_diff_ordered_pairs(NTT_I):
+    NTT_I_T = NTT_I.T
+    rows, double_spectrum_size = NTT_I.shape
+    NTT_R = np.zeros_like(NTT_I[0])
+
+    for d_12 in range(-(rows-1), 1):
+        factors_3 = NTT_I_T[ [k*d_12%double_spectrum_size for k in range(double_spectrum_size) ], : ]
+        for d_23 in range(-(rows-1) - d_12, 1):
+            factors_1 = NTT_I_T[ [k*d_23%double_spectrum_size for k in range(double_spectrum_size) ], : ]
+            factors_2 = NTT_I_T[ [k*(-d_12-d_23)%double_spectrum_size for k in range(double_spectrum_size) ], : ]
+            y_min = 0
+            y_max = rows+d_12+d_23
+            NTT_R += np.sum(
+                factors_1[:,y_min:y_max]*factors_2[:,y_min-d_12:y_max-d_12]*factors_3[:,y_min-d_12-d_23:y_max-d_12-d_23],
+                axis = 1)
+
+    return NTT_R
+
+
 #TODO parallelize
 #TODO memoize (some of) 
 def aggregate_area_spectrum_ntt_per_diff_pairs(NTT_I):
     NTT_I_T = NTT_I.T
     rows, double_spectrum_size = NTT_I.shape
     NTT_R = np.zeros_like(NTT_I[0])
-
-    log = dict()
 
     for d_12 in range(-(rows-1), rows):
         factors_3 = NTT_I_T[ [k*d_12%double_spectrum_size for k in range(double_spectrum_size) ], : ]
@@ -96,14 +156,6 @@ def aggregate_area_spectrum_ntt_per_diff_pairs(NTT_I):
             NTT_R += np.sum(
                     factors_1[:,y_min:y_max]*factors_2[:,y_min-d_12:y_max-d_12]*factors_3[:,y_min-d_12-d_23:y_max-d_12-d_23],
                    axis = 1)
-
-            for k in range(double_spectrum_size):
-                key = tuple(sorted([k*d_12%double_spectrum_size,k*d_23%double_spectrum_size,k*(-d_12-d_23)%double_spectrum_size]))
-                if key not in log:
-                    log[key] = 0
-                log[key] += 1
-
-    print(sorted((log[k], k) for k in log))
 
     return NTT_R
 
@@ -118,24 +170,24 @@ def compute_area_spectrum_ntt_simple(I, p = None):
         if (p-1)%double_spectrum_size == 0:
             break 
         p += 1
-    print(p)
     GF = galois.GF(p)
     rows = I.shape[0]
     NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
-    NTT_R = aggregate_area_spectrum_ntt_per_diff_pairs(NTT_I)
+    NTT_R = aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I)
     result = [ int(v) for v in galois.intt(NTT_R)[:spectrum_size]/GF(3) ]
     recompute_area_spectrum_at_zero(I, result)
     return result
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (5,16), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (4,3), dtype = np.uint8)
     start = time.time()
     reference = compute_spectrum_naive(I)
     print(time.time() - start)
     print(reference)
     compute_area_spectrum_ntt_simple(I)
     start = time.time()
+    print()
     result = compute_area_spectrum_ntt_simple(I)
     print(time.time() - start)
     print(result)
