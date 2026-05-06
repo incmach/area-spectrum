@@ -99,84 +99,53 @@ def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
                     NTT_R += reverse_summand
     return NTT_R
 
-#TODO cache reused products
+do_not_repeat = set()
 #TODO memoize (some of) 
 #TODO parallelize
 def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_with_cache(NTT_I):
     NTT_I_T = NTT_I.T
     rows, double_spectrum_size = NTT_I.shape
     NTT_R = np.zeros_like(NTT_I[0])
-    
-    product_frequency_by_offsets_then_column_triplet = dict()
-    for d_12 in range(-(rows-1), 1):
-        factors_3_idxs = [k*d_12%double_spectrum_size for k in range(double_spectrum_size) ]
-        for d_23 in range(-(rows-1) - d_12, 1):
-            factors_1_idxs = [k*d_23%double_spectrum_size for k in range(double_spectrum_size) ]
-            factors_2_idxs = [k*(-d_12-d_23)%double_spectrum_size for k in range(double_spectrum_size) ]
-            offsets = ( 0, -d_12, -d_12-d_23 )
-            if offsets not in product_frequency_by_offsets_then_column_triplet:
-                product_frequency_by_offsets_then_column_triplet[offsets] = dict()
-            product_frequency = product_frequency_by_offsets_then_column_triplet[offsets]
-            for key in zip(factors_1_idxs, factors_2_idxs, factors_3_idxs):
-                sk = tuple(idx for _, idx in sorted(zip(offsets, key)))
-                if sk not in product_frequency:
-                    product_frequency[sk] = 0
-                product_frequency[sk] += 1
-    
-
-    precomputed_corrs = dict()
-    for offsets, triplets in product_frequency_by_offsets_then_column_triplet.items():
-        idxs = [[], [], []]
-        for triplet, count in triplets.items():
-            if count == 1:
-                continue
-            for i, c in enumerate(triplet):
-                idxs[i].append(c)
-        if len(idxs[0]) == 0:
-            continue
-        factors = [ NTT_I_T[idxs[i]]  for i in range(len(idxs)) ]
-        y_min = 0
-        y_max = rows-offsets[2]
-        
-        precomputed_corrs_part = 3*np.sum(math.prod(f[:,o:y_max+o] for o, f in zip(offsets, factors)), axis = 1)
-        precomputed_corrs[offsets] = { k: v for k, v in zip(zip(*idxs), precomputed_corrs_part) }
 
     for d_12 in range(-(rows-1), 1):
-        factors_3_idxs = [k*d_12%double_spectrum_size for k in range(double_spectrum_size) ]
         for d_23 in range(-(rows-1) - d_12, 1):
-            factors_1_idxs = [k*d_23%double_spectrum_size for k in range(double_spectrum_size) ]
-            factors_2_idxs = [k*(-d_12-d_23)%double_spectrum_size for k in range(double_spectrum_size) ]
-
             offsets = (0, -d_12, -d_12-d_23)
-            precomputed_corrs_part = precomputed_corrs[offsets] if offsets in precomputed_corrs else None
-
-            summand = np.zeros_like(NTT_I[0])
-            idxs = [ [], [], [] ]
-            computation_to_summand_map = []
-            for i, cols in enumerate(zip(factors_1_idxs, factors_2_idxs, factors_3_idxs)):
-                sk = tuple(col for _, col in sorted(zip(offsets, cols)))
-                if precomputed_corrs_part is not None and sk in precomputed_corrs_part:
-                    summand[i] = precomputed_corrs_part[sk]
-                else:
-                    for l, c in zip(idxs, cols):
+            factor_idxs = [[], [], []]
+            if (d_12, d_23) not in do_not_repeat:
+                result_map = []
+                triplets_to_result = dict()
+                for k in range(double_spectrum_size):
+                    idxs = (k*d_23%double_spectrum_size, k*(-d_12-d_23)%double_spectrum_size, k*d_12%double_spectrum_size)
+                    idxs = tuple(idx for _, idx in sorted(zip(offsets, idxs)))
+                    if idxs not in triplets_to_result:
+                        triplets_to_result[idxs] = len(factor_idxs[0])
+                        for l, c in zip(factor_idxs, idxs):
+                            l.append(c)
+                    result_map.append(triplets_to_result[idxs]) 
+                if len(factor_idxs[0]) == double_spectrum_size:
+                    do_not_repeat.add((d_12, d_23))
+            else:
+                for k in range(double_spectrum_size):
+                    idxs = (k*d_23%double_spectrum_size, k*(-d_12-d_23)%double_spectrum_size, k*d_12%double_spectrum_size)
+                    for l, c in zip(factor_idxs, idxs):
                         l.append(c)
-                    computation_to_summand_map.append(i)
+
+            
 
             y_max = rows-offsets[-1]
-            factors = [ NTT_I_T[idx, o:y_max+o] for idx, o in zip(idxs, offsets) ]
+            factors = [ NTT_I_T[idxs,o:y_max+o] for idxs, o in zip(factor_idxs, offsets) ]
+            summand = 3*np.sum(math.prod(factors), axis = 1)
+            if (d_12, d_23) not in do_not_repeat:
+                result = summand[result_map]
+            else:
+                result = summand
 
-            computation = np.sum(math.prod(factors), axis = 1)
-
-            for (i, v) in zip(computation_to_summand_map, computation):
-                summand[i] = 3*v
-
-            NTT_R += summand
+            NTT_R += result
             if d_12 != 0 and d_23 != 0:
-                reverse_summand = np.zeros_like(summand)
-                reverse_summand[0] = summand[0]
-                reverse_summand[1:] = np.flip(summand[1:])
-                NTT_R += reverse_summand
-            
+                reverse_result = np.zeros_like(result)
+                reverse_result[0] = result[0]
+                reverse_result[1:] = np.flip(result[1:])
+                NTT_R += reverse_result
     return NTT_R
 
 def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
@@ -204,7 +173,7 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
                 reverse_summand[0] = summand[0]
                 reverse_summand[1:] = np.flip(summand[1:])
                 NTT_R += reverse_summand
-            
+
     return NTT_R
 
 
@@ -228,29 +197,22 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (8, 16), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (16,1024), dtype = np.uint8)
+
     #start = time.time()
     #reference = compute_spectrum_naive(I)
     #print(time.time() - start)
     #print(reference)
     
     print('No caching:')
-    compute_area_spectrum_ntt_simple(I)
+    compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_with_cache)
     print()
     start = time.time()
     result = compute_area_spectrum_ntt_simple(I)
     print(time.time() - start)
-    print(result)
-
-    print()
-    print('Caching:')
-    compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_with_cache)
-    print()
     start = time.time()
     result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_with_cache)
     print(time.time() - start)
-    print(result)
-
 
     #assert(reference == compute_area_spectrum_ntt_simple(I))
     #assert(reference == compute_area_spectrum_ntt_simple(I, max(reference[1:])))
