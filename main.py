@@ -171,16 +171,20 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
 
     return NTT_R
 
+precomputed_primes = dict()
 def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None):
     spectrum_size = math.prod(I.shape)
     double_spectrum_size = 2*spectrum_size
     if p is None:
         p = math.comb(sum(int(v) for row in I for v in row), 3)
-    while True:
-        p = galois.next_prime(p)
-        if (p-1)%double_spectrum_size == 0:
-            break 
-        p += 1
+    if p in precomputed_primes:
+        p = precomputed_primes[p]
+    else:
+        while True:
+            p = galois.next_prime(p)
+            if (p-1)%double_spectrum_size == 0:
+                break 
+            p += 1
     GF = galois.GF(p)
     rows = I.shape[0]
     NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
@@ -191,7 +195,7 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (8, 256), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (8, 1024), dtype = np.uint8)
 
     #start = time.time()
     #reference = compute_spectrum_naive(I)
@@ -205,14 +209,14 @@ if TEST:
     
     print('unrefactored pass:')
     for i in range(10):
-        start = time.time()
+        start = time.perf_counter()
         result0 = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
-        print(time.time() - start)
+        print(time.perf_counter() - start)
 
     print('refactored pass:')
     for i in range(10):
-        start = time.time()
+        start = time.perf_counter()
         result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, max_as_value)
-        print(time.time() - start)
+        print(time.perf_counter() - start)
 
     assert(result0 == result)
