@@ -99,49 +99,30 @@ def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
                     NTT_R += reverse_summand
     return NTT_R
 
-factors_1_2_idxs_cache = dict()
-factors_3_idxs_cache = dict()
-
 factors_idxs_cache = dict()
-def get_factors_idxs(NTT_I):
-    if NTT_I.shape in factors_idxs_cache:
-        return factors_idxs_cache[NTT_I.shape] 
-    _, L = NTT_I.shape
-    result = [ np.arange(L)*d%L for d in it.chain(range(rows), range(1-rows,0)) ]
-    factors_idxs_cache[NTT_I.shape] = result
+def get_factors_idxs(shape):
+    if shape in factors_idxs_cache:
+        return factors_idxs_cache[shape] 
+    rows, L = shape
+    result = np.array([ np.arange(L)*d%L for d in it.chain(range(rows), range(1-rows,0)) ])
+    factors_idxs_cache[shape] = result
     return result
 
-#TODO refactor to (a) get rid of 1,2,3, (b) avoid unnecessary array inits
 #TODO parallelize via joblib
 def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
     NTT_I_T = NTT_I.T
     rows, double_spectrum_size = NTT_I.shape
     NTT_R = np.zeros_like(NTT_I[0])
 
-    log = set()
-    n = 0
+    all_factors_idxs = get_factors_idxs(NTT_I.shape)
+    precomputed_factors = [ NTT_I_T[idxs] for idxs in all_factors_idxs ]
+
     for d_12 in range(-(rows-1), 1):
-        if (double_spectrum_size, d_12) in factors_3_idxs_cache:
-            factors_3_idxs = factors_3_idxs_cache[(double_spectrum_size, d_12)]
-        else:
-            factors_3_idxs = [k*d_12%double_spectrum_size for k in range(double_spectrum_size) ]
-            factors_3_idxs_cache[(double_spectrum_size, d_12)] = factors_3_idxs
-        factors_3 = NTT_I_T[ factors_3_idxs, : ]
         for d_23 in range(-(rows-1) - d_12, 1):
             y_max = rows+d_12+d_23
-
-            if (double_spectrum_size, d_12, d_23) in factors_1_2_idxs_cache:
-                factors_1_idxs, factors_2_idxs = factors_1_2_idxs_cache[(double_spectrum_size, d_12, d_23)]
-            else:
-                factors_1_idxs = [k*d_23%double_spectrum_size for k in range(double_spectrum_size) ]
-                factors_2_idxs = [k*(-d_12-d_23)%double_spectrum_size for k in range(double_spectrum_size) ]
-                factors_1_2_idxs_cache[(double_spectrum_size, d_12, d_23)] = (factors_1_idxs, factors_2_idxs)
-
-            factors_1 = NTT_I_T[ factors_1_idxs, :y_max ]
-            factors_2 = NTT_I_T[ factors_2_idxs, -d_12:y_max-d_12 ]
-            
             summand = 3*np.sum(
-                factors_1*factors_2*factors_3[:,-d_12-d_23:y_max-d_12-d_23],
+                math.prod(precomputed_factors[i][:,lower:upper] for (i, lower, upper) in
+                          [ (d_23, 0, y_max), (-d_12-d_23, -d_12, y_max-d_12), (d_12, -d_12-d_23, y_max-d_12-d_23) ]),
                 axis = 1)
 
             NTT_R += summand
@@ -149,21 +130,16 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
                 NTT_R[0] += summand[0]
                 NTT_R[1:] += np.flip(summand[1:])
 
-            for cols in zip(factors_1_idxs, factors_2_idxs, factors_3_idxs):
-                log.add(tuple(sorted(zip(cols, [ 0, -d_12, -d_12-d_23 ]))))
-            n += double_spectrum_size
-     
-    print(f'{len(log)}/{n}')
-
     return NTT_R
+
+factors_1_2_idxs_cache = dict()
+factors_3_idxs_cache = dict()
 
 def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
     NTT_I_T = NTT_I.T
     rows, double_spectrum_size = NTT_I.shape
     NTT_R = np.zeros_like(NTT_I[0])
 
-    log = set()
-    n = 0
     for d_12 in range(-(rows-1), 1):
         if (double_spectrum_size, d_12) in factors_3_idxs_cache:
             factors_3_idxs = factors_3_idxs_cache[(double_spectrum_size, d_12)]
@@ -193,10 +169,6 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
                 NTT_R[0] += summand[0]
                 NTT_R[1:] += np.flip(summand[1:])
 
-            for cols in zip(factors_1_idxs, factors_2_idxs, factors_3_idxs):
-                log.add(tuple(sorted(zip(cols, [ 0, -d_12, -d_12-d_23 ]))))
-            n += double_spectrum_size
-     
     return NTT_R
 
 def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None):
@@ -219,7 +191,7 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (8, 16), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (8, 256), dtype = np.uint8)
 
     #start = time.time()
     #reference = compute_spectrum_naive(I)
@@ -232,15 +204,15 @@ if TEST:
     print(f'max AS value is {max_as_value}')
     
     print('unrefactored pass:')
-    for i in range(2):
+    for i in range(10):
         start = time.time()
-        result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
+        result0 = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
         print(time.time() - start)
-    print(result)
 
     print('refactored pass:')
-    for i in range(2):
+    for i in range(10):
         start = time.time()
         result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, max_as_value)
         print(time.time() - start)
-    print(result)
+
+    assert(result0 == result)
