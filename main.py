@@ -103,28 +103,28 @@ def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
 
 factors_idxs_cache = dict()
 def get_factors_idxs(shape):
-    if shape in factors_idxs_cache:
-        return factors_idxs_cache[shape] 
     rows, L = shape
-    result = np.array([ np.arange(L)*d%L for d in it.chain(range(rows), range(1-rows,0)) ])
-    factors_idxs_cache[shape] = result
-    return result
+    if shape in factors_idxs_cache:
+        shm = shared_memory.SharedMemory(factors_idxs_cache[shape])
+    else:
+        shm = shared_memory.SharedMemory(create = True, size = L*(2*rows-1)*4)
+    result = np.ndarray((2*rows-1, L), dtype = np.int32, buffer = shm.buf)
+    if shape not in factors_idxs_cache:
+        for d in it.chain(range(rows), range(1-rows,0)):
+            result[d] = np.arange(L)*d%L
+        factors_idxs_cache[shape] = shm.name
+    return result, shm
+
 
 #TODO put NTT_I_T into shared memory
 #TODO preallocate results
 def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
     NTT_I_T = NTT_I.T
-    #NTT_I_T_shm_name = 'ntt_i_t'
-    #NTT_I_T_shm = shared_memory.SharedMemory(create = True, name = NTT_I_T_shm_name, size = NTT_I.nbytes)
-    
-    #NTT_I_T = GF(np.ndarray((double_spectrum_size, rows), dtype = NTT_I.dtype, buffer = NtTT_I_T_shm.buf))
-    #NTT_I_T[:,:] = NTT_I.T
-
-    all_factors_idxs = get_factors_idxs(NTT_I.shape)
+    get_factors_idxs(NTT_I.shape)
 
     def compute_area_spectrum_summand(d_12):
-        common_factor = NTT_I_T[all_factors_idxs[d_12],:]
+        all_factors_idxs, closeable = get_factors_idxs(NTT_I.shape)     
         result = np.zeros_like(NTT_I_T[:,0])
         for d_23 in range(1-rows-d_12, 1):
             y_max = rows+d_12+d_23
@@ -136,6 +136,8 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
                 summand[0] *= 2
                 summand[1:] += np.flip(summand[1:])
             result += summand
+        del all_factors_idxs
+        closeable.close()
         return result
 
 
@@ -234,10 +236,15 @@ if TEST:
         result0 = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
         print(time.perf_counter() - start)
 
-    print('refactored pass:')
-    for i in range(2):
-        start = time.perf_counter()
-        result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, max_as_value)
-        print(time.perf_counter() - start)
-
+    try:
+        print('refactored pass:')
+        for i in range(2):
+            start = time.perf_counter()
+            result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, max_as_value)
+            print(time.perf_counter() - start)
+    finally:
+        for it in factors_idxs_cache:
+            shm = shared_memory.SharedMemory(factors_idxs_cache[it])
+            shm.close()
+            shm.unlink()
     assert(result0 == result)
