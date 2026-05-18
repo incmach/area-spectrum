@@ -1,10 +1,12 @@
-import functools as ft
 import itertools as it
 import math
 import time
 
 import numpy as np
 import galois
+
+import joblib
+from multiprocessing import shared_memory
 
 TEST = True
 
@@ -108,29 +110,48 @@ def get_factors_idxs(shape):
     factors_idxs_cache[shape] = result
     return result
 
-#TODO parallelize via joblib
+#TODO put NTT_I_T into shared memory
+#TODO preallocate results
 def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
-    NTT_I_T = NTT_I.T
     rows, double_spectrum_size = NTT_I.shape
-    NTT_R = np.zeros_like(NTT_I[0])
+    NTT_I_T = NTT_I.T
+    #NTT_I_T_shm_name = 'ntt_i_t'
+    #NTT_I_T_shm = shared_memory.SharedMemory(create = True, name = NTT_I_T_shm_name, size = NTT_I.nbytes)
+    
+    #NTT_I_T = GF(np.ndarray((double_spectrum_size, rows), dtype = NTT_I.dtype, buffer = NtTT_I_T_shm.buf))
+    #NTT_I_T[:,:] = NTT_I.T
 
     all_factors_idxs = get_factors_idxs(NTT_I.shape)
-    precomputed_factors = [ NTT_I_T[idxs] for idxs in all_factors_idxs ]
 
-    for d_12 in range(-(rows-1), 1):
-        for d_23 in range(-(rows-1) - d_12, 1):
+    def compute_area_spectrum_summand(d_12):
+        common_factor = NTT_I_T[all_factors_idxs[d_12],:]
+        result = np.zeros_like(NTT_I_T[:,0])
+        for d_23 in range(1-rows-d_12, 1):
             y_max = rows+d_12+d_23
             summand = 3*np.sum(
-                math.prod(precomputed_factors[i][:,lower:upper] for (i, lower, upper) in
-                          [ (d_23, 0, y_max), (-d_12-d_23, -d_12, y_max-d_12), (d_12, -d_12-d_23, y_max-d_12-d_23) ]),
+                      math.prod(NTT_I_T[all_factors_idxs[i],lower:upper] for (i, lower, upper) in
+                      [ (d_23, 0, y_max), (-d_12-d_23, -d_12, y_max-d_12), (d_12, -d_12-d_23, rows) ]),
                 axis = 1)
-
-            NTT_R += summand
             if d_12 != 0 and d_23 != 0:
-                NTT_R[0] += summand[0]
-                NTT_R[1:] += np.flip(summand[1:])
+                summand[0] *= 2
+                summand[1:] += np.flip(summand[1:])
+            result += summand
+        return result
 
-    return NTT_R
+
+    summands = joblib.Parallel(n_jobs=8, return_as = 'generator')(
+            joblib.delayed(compute_area_spectrum_summand)(d_12)
+            for d_12 in range(1-rows, 1))
+    
+    
+    result = np.zeros_like(NTT_I[0])
+    for summand in summands:
+        result += summand
+
+    #NTT_I_T_buf.close()
+    #NTT_I_T_buf.unlink()
+
+    return result
 
 factors_1_2_idxs_cache = dict()
 factors_3_idxs_cache = dict()
@@ -195,7 +216,7 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (8, 1024), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (16, 128), dtype = np.uint8)
 
     #start = time.time()
     #reference = compute_spectrum_naive(I)
@@ -208,13 +229,13 @@ if TEST:
     print(f'max AS value is {max_as_value}')
     
     print('unrefactored pass:')
-    for i in range(10):
+    for i in range(2):
         start = time.perf_counter()
         result0 = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
         print(time.perf_counter() - start)
 
     print('refactored pass:')
-    for i in range(10):
+    for i in range(2):
         start = time.perf_counter()
         result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, max_as_value)
         print(time.perf_counter() - start)
