@@ -115,14 +115,11 @@ def get_factors_idxs(shape):
         factors_idxs_cache[shape] = shm.name
     return result, shm
 
-
-#TODO put NTT_I_T into shared memory
-#TODO preallocate results
+#TODO clean up shm handling
 def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
     dt = NTT_I.dtype
     p = NTT_I._order
-    GF = galois.GF(p)
 
     NTT_I_T_shm = shared_memory.SharedMemory(create = True, size = NTT_I.nbytes)
     NTT_I_T_shm_name = NTT_I_T_shm.name
@@ -152,7 +149,7 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
         return result
 
 
-    summands = joblib.Parallel(n_jobs=8, return_as = 'generator')(
+    summands = joblib.Parallel(n_jobs=4, return_as = 'generator')(
             joblib.delayed(compute_area_spectrum_summand)(d_12)
             for d_12 in range(1-rows, 1))
     
@@ -205,6 +202,7 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
 
     return NTT_R
 
+#TODO CRT for orders over 2**20
 precomputed_primes = dict()
 def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None):
     spectrum_size = math.prod(I.shape)
@@ -229,7 +227,7 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (16, 32), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (8, 64), dtype = np.uint8)
 
     #start = time.time()
     #reference = compute_spectrum_naive(I)
