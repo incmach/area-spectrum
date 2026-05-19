@@ -120,11 +120,22 @@ def get_factors_idxs(shape):
 #TODO preallocate results
 def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
-    NTT_I_T = NTT_I.T
+    dt = NTT_I.dtype
+    p = NTT_I._order
+    GF = galois.GF(p)
+
+    NTT_I_T_shm = shared_memory.SharedMemory(create = True, size = NTT_I.nbytes)
+    NTT_I_T_shm_name = NTT_I_T_shm.name
+    NTT_I_T = np.ndarray((double_spectrum_size, rows), dtype = dt, buffer = NTT_I_T_shm.buf)
+    NTT_I_T[:,:] = NTT_I.T
+
     get_factors_idxs(NTT_I.shape)
 
     def compute_area_spectrum_summand(d_12):
-        all_factors_idxs, closeable = get_factors_idxs(NTT_I.shape)     
+        NTT_I_T_shm = shared_memory.SharedMemory(NTT_I_T_shm_name)
+        GF = galois.GF(p)
+        NTT_I_T = GF(np.ndarray((double_spectrum_size, rows), dtype = dt, buffer = NTT_I_T_shm.buf))
+        all_factors_idxs, closeable = get_factors_idxs((rows, double_spectrum_size))
         result = np.zeros_like(NTT_I_T[:,0])
         for d_23 in range(1-rows-d_12, 1):
             y_max = rows+d_12+d_23
@@ -136,8 +147,8 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
                 summand[0] *= 2
                 summand[1:] += np.flip(summand[1:])
             result += summand
-        del all_factors_idxs
         closeable.close()
+        NTT_I_T_shm.close()
         return result
 
 
@@ -150,8 +161,8 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
     for summand in summands:
         result += summand
 
-    #NTT_I_T_buf.close()
-    #NTT_I_T_buf.unlink()
+    NTT_I_T_shm.close()
+    NTT_I_T_shm.unlink()
 
     return result
 
@@ -218,7 +229,7 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (16, 128), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (16, 32), dtype = np.uint8)
 
     #start = time.time()
     #reference = compute_spectrum_naive(I)
