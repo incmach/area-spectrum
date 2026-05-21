@@ -1,4 +1,5 @@
 import itertools as it
+import functools as ft
 import math
 import time
 
@@ -13,20 +14,54 @@ TEST = True
 def recompute_area_spectrum_at_zero(I, spectrum):
     spectrum[0] = math.comb(sum(sum(int(v) for v in row) for row in I), 3) - sum(spectrum[1:])
 
-#TODO joblib
 def compute_spectrum_naive(I):
-    result = 2*math.prod(I.shape)*[int(0)]
-    for vs in it.product(it.product(*[range(n) for n in I.shape]), repeat = len(I.shape) + 1):
-        signed_area = int(np.round(np.linalg.det(
-            [ [ vs[i+1][j] - vs[0][j] for j in range(len(I.shape)) ] for i in range(len(I.shape)) ])))
-        if signed_area == 0:
-            continue
-        result[signed_area] += math.prod(int(I[v]) for v in vs)
-    for i, v in enumerate(result):
-        result[i] = v//3
-    if result:
-        result = result[:math.prod(I.shape)]
-        recompute_area_spectrum_at_zero(I, result)
+    I_shm = shared_memory.SharedMemory(create = True, size = I.nbytes + 1)
+    I_shm_name = I_shm.name
+    I_shape = I.shape
+    rows, cols = I_shape
+    I_dtype = I.dtype
+    _I = np.ndarray(I_shape, dtype = I_dtype, buffer = I_shm.buf)
+    _I[:,:] = I
+
+    def points_after(v0):
+        y0, x0 = v0
+        for x in range(x0+1, cols):
+            yield (y0, x)
+        for y in range(y0+1, rows):
+            for x in range(cols):
+                yield (y, x)
+
+    def compute_summand(v0):
+        I_shm = shared_memory.SharedMemory(I_shm_name)
+        
+        I = np.ndarray(I_shape, dtype = I_dtype, buffer = I_shm.buf)
+        result = math.prod(I.shape)*[int(0)]
+        result[0] += math.comb(int(I[v0]), 3) # v0 == v1 == v2
+        for v2 in points_after(v0):
+            result[0] += math.comb(int(I[v0]), 2)*int(I[v2]) # v0 == v1 < v2
+        for v1 in points_after(v0):
+            result[0] += int(I[v0])*math.comb(int(I[v1]), 2) # v0 < v1 == v2
+            for v2 in points_after(v1):
+                vs = [ v1, v2 ]
+                area = abs(int(np.round(np.linalg.det(
+                    [ [ vs[i][j] - v0[j] for j in range(len(I.shape)) ] for i in range(len(I.shape)) ]))))
+                result[area] += math.prod(int(I[v]) for v in [ v0, v1, v2 ])
+
+        I_shm.close()
+
+        return result
+
+    summands = joblib.Parallel(n_jobs=16, return_as = 'generator')(
+            joblib.delayed(compute_summand)(v0)
+            for v0 in it.product(range(rows), range(cols)))
+    result = math.prod(I.shape)*[int(0)]
+    for s in summands:
+        for i, v in enumerate(result):
+            result[i] += s[i]
+
+    I_shm.close()
+    I_shm.unlink()
+
     return result
         
 if TEST:
@@ -202,7 +237,7 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
 
     return NTT_R
 
-#TODO CRT for orders over 2**20
+#TODO CRT for large primes (larger than 2**20)
 precomputed_primes = dict()
 def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None):
     spectrum_size = math.prod(I.shape)
@@ -227,12 +262,11 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (8, 64), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (16, 32), dtype = np.uint8)
 
-    #start = time.time()
-    #reference = compute_spectrum_naive(I)
-    #print(time.time() - start)
-    #print(reference)
+    start = time.perf_counter()
+    reference = compute_spectrum_naive(I)
+    print(time.perf_counter() - start)
     
     max_binary_as = compute_area_spectrum_ntt_simple(np.ones(I.shape, dtype = np.uint8))
     max_as_value = int(np.max(I))**3*max(max_binary_as[1:])
@@ -245,6 +279,7 @@ if TEST:
         result0 = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
         print(time.perf_counter() - start)
 
+    assert(result0 == reference)
     try:
         print('refactored pass:')
         for i in range(2):
