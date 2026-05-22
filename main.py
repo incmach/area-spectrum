@@ -15,13 +15,7 @@ def recompute_area_spectrum_at_zero(I, spectrum):
     spectrum[0] = math.comb(sum(sum(int(v) for v in row) for row in I), 3) - sum(spectrum[1:])
 
 def compute_spectrum_naive(I):
-    I_shm = shared_memory.SharedMemory(create = True, size = I.nbytes + 1)
-    I_shm_name = I_shm.name
-    I_shape = I.shape
-    rows, cols = I_shape
-    I_dtype = I.dtype
-    _I = np.ndarray(I_shape, dtype = I_dtype, buffer = I_shm.buf)
-    _I[:,:] = I
+    rows, cols = I.shape
 
     def points_after(v0):
         y0, x0 = v0
@@ -32,9 +26,6 @@ def compute_spectrum_naive(I):
                 yield (y, x)
 
     def compute_summand(v0):
-        I_shm = shared_memory.SharedMemory(I_shm_name)
-        
-        I = np.ndarray(I_shape, dtype = I_dtype, buffer = I_shm.buf)
         result = math.prod(I.shape)*[int(0)]
         result[0] += math.comb(int(I[v0]), 3) # v0 == v1 == v2
         for v2 in points_after(v0):
@@ -47,8 +38,6 @@ def compute_spectrum_naive(I):
                     [ [ vs[i][j] - v0[j] for j in range(len(I.shape)) ] for i in range(len(I.shape)) ]))))
                 result[area] += math.prod(int(I[v]) for v in [ v0, v1, v2 ])
 
-        I_shm.close()
-
         return result
 
     summands = joblib.Parallel(n_jobs=16, return_as = 'generator')(
@@ -58,9 +47,6 @@ def compute_spectrum_naive(I):
     for s in summands:
         for i, v in enumerate(result):
             result[i] += s[i]
-
-    I_shm.close()
-    I_shm.unlink()
 
     return result
         
