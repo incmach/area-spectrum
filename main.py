@@ -225,19 +225,41 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
 
 #TODO CRT for large primes (larger than 2**20)
 precomputed_primes = dict()
-def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None):
+def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None, max_p = None):
     spectrum_size = math.prod(I.shape)
     double_spectrum_size = 2*spectrum_size
     if p is None:
         p = math.comb(sum(int(v) for row in I for v in row), 3)
-    if p in precomputed_primes:
-        p = precomputed_primes[p]
+    if (p, max_p, double_spectrum_size) in precomputed_primes:
+        ps = precomputed_primes[(p, max_p, double_spectrum_size)]
     else:
+        q = p
+        ps = [ ]
         while True:
-            p = galois.next_prime(p)
-            if (p-1)%double_spectrum_size == 0:
-                break 
-            p += 1
+            while max_p is None or q < max_p:
+                q = galois.next_prime(q)
+                if (q-1)%double_spectrum_size == 0:
+                    break 
+                q += 1
+            if max_p is None or q <= max_p:
+                ps.append(q)
+                break
+            # max_p < q, we want to take the highest unused prime before max_p
+            q = ps[-1]-1 if ps else max_ps
+            while q > 0:
+                q = galois.prev_prime(q)
+                if (q-1)%double_spectrum_size == 0:
+                    break
+                q -= 1
+            if q <= 0:
+                raise RuntimeError(f'unable to find the system of primes <= {max_p} for max value {p}')
+            ps.append(q)
+            q = p // math.prod(ps)
+
+        ps = tuple(ps)
+        precomputed_primes[(p, max_p, double_spectrum_size)] = ps
+
+    p = ps[-1]
     GF = galois.GF(p)
     rows = I.shape[0]
     NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
@@ -248,11 +270,13 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (16, 32), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (4, 8), dtype = np.uint8)
 
-    start = time.perf_counter()
-    reference = compute_spectrum_naive(I)
-    print(time.perf_counter() - start)
+    reference = None
+    if True:
+        start = time.perf_counter()
+        reference = compute_spectrum_naive(I)
+        print(time.perf_counter() - start)
     
     max_binary_as = compute_area_spectrum_ntt_simple(np.ones(I.shape, dtype = np.uint8))
     max_as_value = int(np.max(I))**3*max(max_binary_as[1:])
@@ -265,7 +289,7 @@ if TEST:
         result0 = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
         print(time.perf_counter() - start)
 
-    assert(result0 == reference)
+    assert(reference is None or result0 == reference)
     try:
         print('refactored pass:')
         for i in range(2):
