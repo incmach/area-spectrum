@@ -97,8 +97,6 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
             for y_i in range(3)
         ]
         summand = math.prod(complement)
-        if set(ys) == {0,1,3}:
-            print(f'{ys}: {summand}')
         NTT_R += math.prod(complement)
     return NTT_R
 
@@ -223,6 +221,7 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
 
     return NTT_R
 
+#TODO factorize p+k, recurse?
 #TODO CRT for large primes (larger than 2**20)
 precomputed_primes = dict()
 def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None, max_p = None):
@@ -244,8 +243,7 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
             if max_p is None or q <= max_p:
                 ps.append(q)
                 break
-            # max_p < q, we want to take the highest unused prime before max_p
-            q = ps[-1]-1 if ps else max_ps
+            q = ps[-1]-1 if ps else max_p
             while q > 0:
                 q = galois.prev_prime(q)
                 if (q-1)%double_spectrum_size == 0:
@@ -254,17 +252,22 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
             if q <= 0:
                 raise RuntimeError(f'unable to find the system of primes <= {max_p} for max value {p}')
             ps.append(q)
-            q = p // math.prod(ps)
-
+            q = p//math.prod(ps) + 1
         ps = tuple(ps)
         precomputed_primes[(p, max_p, double_spectrum_size)] = ps
 
-    p = ps[-1]
-    GF = galois.GF(p)
-    rows = I.shape[0]
-    NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
-    NTT_R = aggregator(NTT_I)
-    result = [ int(v) for v in galois.intt(NTT_R)[:spectrum_size]/GF(3) ]
+    results = []
+    for p in ps:
+        GF = galois.GF(p)
+        rows = I.shape[0]
+        NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
+        NTT_R = aggregator(NTT_I)
+        results.append([ int(v) for v in galois.intt(NTT_R)[:spectrum_size] ])
+
+    result = [ 0 ]
+    for r in it.islice(zip(*results), 1, None):
+        result.append((galois.crt(r, ps) if len(ps) > 1 else r[0])//3)
+
     recompute_area_spectrum_at_zero(I, result)
     return result
 
@@ -294,11 +297,14 @@ if TEST:
         print('refactored pass:')
         for i in range(2):
             start = time.perf_counter()
-            result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, max_as_value)
+            result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, max_as_value, 2**20)
             print(time.perf_counter() - start)
     finally:
         for it in factors_idxs_cache:
             shm = shared_memory.SharedMemory(factors_idxs_cache[it])
             shm.close()
             shm.unlink()
+
+    print(result0)
+    print(result)
     assert(result0 == result)
