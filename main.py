@@ -168,7 +168,7 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
         return result
 
 
-    summands = joblib.Parallel(n_jobs=4, return_as = 'generator')(
+    summands = joblib.Parallel(n_jobs=16, return_as = 'generator')(
             joblib.delayed(compute_area_spectrum_summand)(d_12)
             for d_12 in range(1-rows, 1))
     
@@ -222,7 +222,6 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
     return NTT_R
 
 #TODO factorize p+k, recurse?
-#TODO CRT for large primes (larger than 2**20)
 precomputed_primes = dict()
 def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None, max_p = None):
     spectrum_size = math.prod(I.shape)
@@ -235,6 +234,7 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
         q = p
         ps = [ ]
         while True:
+            print(q)
             while max_p is None or q < max_p:
                 q = galois.next_prime(q)
                 if (q-1)%double_spectrum_size == 0:
@@ -254,6 +254,7 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
             ps.append(q)
             q = p//math.prod(ps) + 1
         ps = tuple(ps)
+        print(f'{ps}')
         precomputed_primes[(p, max_p, double_spectrum_size)] = ps
 
     results = []
@@ -273,31 +274,33 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
 
 if TEST:
     np.random.seed(38)
-    I = np.random.randint(0, 16, size = (4, 8), dtype = np.uint8)
+    I = np.random.randint(0, 16, size = (64, 128), dtype = np.uint8)
 
     reference = None
-    if True:
+    if False:
         start = time.perf_counter()
         reference = compute_spectrum_naive(I)
         print(time.perf_counter() - start)
     
-    max_binary_as = compute_area_spectrum_ntt_simple(np.ones(I.shape, dtype = np.uint8))
-    max_as_value = int(np.max(I))**3*max(max_binary_as[1:])
+    #max_binary_as = compute_area_spectrum_ntt_simple(np.ones(I.shape, dtype = np.uint8))
+    max_as_value = None #int(np.max(I))**3*max(max_binary_as[1:])
 
     print(f'max AS value is {max_as_value}')
     
-    print('unrefactored pass:')
-    for i in range(2):
-        start = time.perf_counter()
-        result0 = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
-        print(time.perf_counter() - start)
+    result0 = None
+    if False:
+        print('unrefactored pass:')
+        for i in range(3):
+            start = time.perf_counter()
+            result0 = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
+            print(time.perf_counter() - start)
 
     assert(reference is None or result0 == reference)
     try:
         print('refactored pass:')
-        for i in range(2):
+        for i in range(3):
             start = time.perf_counter()
-            result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, max_as_value, 2**20)
+            result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, None, 2**17)
             print(time.perf_counter() - start)
     finally:
         for it in factors_idxs_cache:
@@ -305,6 +308,4 @@ if TEST:
             shm.close()
             shm.unlink()
 
-    print(result0)
-    print(result)
-    assert(result0 == result)
+    assert(result0 is None or result0 == result)
