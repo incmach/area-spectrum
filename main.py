@@ -80,14 +80,6 @@ if TEST:
         if i%2 == 1:
             assert(stretched_as[i] == 0)
 
-def compute_max_spectrum(image_shape, max_pixel_value):
-    multiplier = max_pixel_value**3
-    result = [ multiplier*v for v in compute_spectrum_naive(np.ones(image_shape, dtype = np.uint8)) ]
-    return result
-
-if TEST: 
-    assert(compute_max_spectrum((4,4), 255)[1:] == compute_spectrum_naive(255*np.ones((4,4), dtype=np.uint8))[1:])
-
 def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
     NTT_R = np.zeros_like(NTT_I[0])
@@ -168,7 +160,6 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
         return result
 
 
-    #TODO lessen paralelism
     summands = joblib.Parallel(n_jobs=16, return_as = 'generator')(
             joblib.delayed(compute_area_spectrum_summand)(d_12)
             for d_12 in range(1-rows, 1))
@@ -233,12 +224,12 @@ def get_min_ps(p, double_spectrum_size):
         if (q-1)%double_spectrum_size == 0:
             ps.append(q)
         q += 1
-        print(f'{q-1}//{double_spectrum_size}: {ps}: {math.prod(ps)}/{p}')
     ps = tuple(ps)
     precomputed_primes[(p, double_spectrum_size)] = ps
     return ps
 
 def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None, max_p = None):
+    rows, cols = I.shape
     spectrum_size = math.prod(I.shape)
     double_spectrum_size = 2*spectrum_size
     if p is None:
@@ -249,14 +240,17 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
 
     print(f'{ps} -> {math.prod(ps)}/{p}')
 
-    results = []
-    #TODO parallelize me!
-    for p in ps:
+    def f(p):
         GF = galois.GF(p)
         rows = I.shape[0]
         NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
         NTT_R = aggregator(NTT_I)
-        results.append([ int(v) for v in galois.intt(NTT_R)[:spectrum_size] ])
+        return [ int(v) for v in galois.intt(NTT_R)[:spectrum_size] ]
+
+    get_factors_idxs((rows, double_spectrum_size))
+    results = joblib.Parallel(n_jobs=2, return_as = 'generator')(
+            joblib.delayed(f)(p)
+            for p in ps)
 
     result = [ 0 ]
     for r in it.islice(zip(*results), 1, None):
@@ -292,7 +286,7 @@ if TEST:
     try:
         print('refactored pass:')
         for _ in range(10):
-            I = np.random.randint(0, 256, size = (2**2, 2**16), dtype = np.uint8)
+            I = np.random.randint(0, 256, size = (2**2, 2**13), dtype = np.uint8)
             start = time.perf_counter()
             result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, None, 2**25)
             print(time.perf_counter() - start)
