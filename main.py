@@ -260,6 +260,7 @@ def get_ps_through_log(p, max_p, double_spectrum_size):
             raise RuntimeError(
                     f'unable to find the system of primes <= {max_p} for max value {p} and array size {double_spectrum_size}')
         ps.append(q)
+        
     ps = tuple(ps)
     precomputed_primes[(p, max_p, double_spectrum_size)] = ps
     return ps
@@ -338,15 +339,16 @@ if TEST:
     if False:
         print('unrefactored pass:')
         for i in range(3):
-            I = np.random.randint(0, 256, size = (8, 64), dtype = np.uint8)
             start = time.perf_counter()
             result0 = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
             print(time.perf_counter() - start)
 
     assert(reference is None or result0 == reference)
+    #TODO why does it take two runs to warm up?
     try:
         print('refactored pass:')
-        for i in range(3):
+        for _ in range(10):
+            I = np.random.randint(0, 256, size = (16, 512), dtype = np.uint8)
             start = time.perf_counter()
             result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, None, 2**20)
             print(time.perf_counter() - start)
