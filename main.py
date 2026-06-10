@@ -9,7 +9,17 @@ import galois
 import joblib
 from multiprocessing import shared_memory
 
+#TODO!!! clean up + not pass 0s element around
+
 TEST = True
+
+def double_volume(*vs):
+    v0 = vs[0]
+    vs = vs[1:]
+    return abs(int(np.round(np.linalg.det(
+        [ 
+            [ vij - v0j for vij, v0j in zip(vi, v0) ]
+        for vi in vs ]))))
 
 def recompute_area_spectrum_at_zero(I, spectrum):
     spectrum[0] = math.comb(sum(sum(int(v) for v in row) for row in I), 3) - sum(spectrum[1:])
@@ -33,9 +43,7 @@ def compute_spectrum_naive(I):
         for v1 in points_after(v0):
             result[0] += int(I[v0])*math.comb(int(I[v1]), 2) # v0 < v1 == v2
             for v2 in points_after(v1):
-                vs = [ v1, v2 ]
-                area = abs(int(np.round(np.linalg.det(
-                    [ [ vs[i][j] - v0[j] for j in range(len(I.shape)) ] for i in range(len(I.shape)) ]))))
+                area = double_volume(v0, v1, v2)
                 result[area] += math.prod(int(I[v]) for v in [ v0, v1, v2 ])
 
         return result
@@ -49,7 +57,7 @@ def compute_spectrum_naive(I):
             result[i] += s[i]
 
     return result
-        
+
 if TEST:
     assert(compute_spectrum_naive(np.zeros((0, 0), dtype = np.uint8)) == [ ])
     assert(len(compute_spectrum_naive(np.zeros((1, 1), dtype = np.uint8))) == 1)
@@ -79,6 +87,40 @@ if TEST:
             assert(unstretched_as[i] == 0)
         if i%2 == 1:
             assert(stretched_as[i] == 0)
+
+def compute_spectrum_gradient_naive(I, as_target, compute_as = compute_spectrum_naive):
+    rows, cols = I.shape
+    direction = [ t - v for t, v in zip(as_target, compute_as(I)) ]
+    direction[0] = 0
+
+    def points_after(v0):
+        y0, x0 = v0
+        for x in range(x0+1, cols):
+            yield (y0, x)
+        for y in range(y0+1, rows):
+            for x in range(cols):
+                yield (y, x)
+
+    def compute_grad_element(v0):
+        result = 0
+        for v1 in it.product(range(rows), range(cols)):
+            for v2 in points_after(v1):
+                vs = [ v1, v2 ]
+                result += int(I[v1])*int(I[v2])*direction[double_volume(v0, v1, v2)]
+        return (v0, result)
+
+    grad_elements = joblib.Parallel(n_jobs=16, return_as = 'generator')(
+            joblib.delayed(compute_grad_element)(v0_idx)
+            for v0 in it.product(range(rows), range(cols)))
+    result = rows * [ [ 0 ] * cols ]
+    for v0, e in grad_elements:
+        result[v0] = e
+
+    return result
+
+#TODO gradient tests
+if TEST:
+    pass
 
 def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
