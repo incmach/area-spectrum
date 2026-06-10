@@ -9,6 +9,7 @@ import galois
 import joblib
 from multiprocessing import shared_memory
 
+#TODO what should we do with zeros?
 #TODO!!! clean up + not pass 0s element around
 
 TEST = True
@@ -88,10 +89,12 @@ if TEST:
         if i%2 == 1:
             assert(stretched_as[i] == 0)
 
+
 def compute_spectrum_gradient_naive(I, as_target, compute_as = compute_spectrum_naive):
     rows, cols = I.shape
     direction = [ t - v for t, v in zip(as_target, compute_as(I)) ]
-    direction[0] = 0
+    if direction:
+        direction[0] = 0
 
     def points_after(v0):
         y0, x0 = v0
@@ -102,25 +105,37 @@ def compute_spectrum_gradient_naive(I, as_target, compute_as = compute_spectrum_
                 yield (y, x)
 
     def compute_grad_element(v0):
-        result = 0
-        for v1 in it.product(range(rows), range(cols)):
-            for v2 in points_after(v1):
-                vs = [ v1, v2 ]
-                result += int(I[v1])*int(I[v2])*direction[double_volume(v0, v1, v2)]
-        return (v0, result)
+        return (v0,
+                sum(int(I[v1])*int(I[v2])*direction[double_volume(v0, v1, v2)]
+                    for v1 in it.product(range(rows), range(cols))
+                    for v2 in points_after(v1)))
 
     grad_elements = joblib.Parallel(n_jobs=16, return_as = 'generator')(
-            joblib.delayed(compute_grad_element)(v0_idx)
+            joblib.delayed(compute_grad_element)(v0)
             for v0 in it.product(range(rows), range(cols)))
-    result = rows * [ [ 0 ] * cols ]
-    for v0, e in grad_elements:
-        result[v0] = e
+    
+    result = np.zeros(I.shape, dtype = np.uint8).astype(int)
+    for v, e in grad_elements:
+        result[v] = e
 
     return result
 
-#TODO gradient tests
 if TEST:
-    pass
+    assert(compute_spectrum_gradient_naive(np.zeros((0,0), dtype = np.uint8), []).shape == (0,0))
+    assert(np.array_equal(compute_spectrum_gradient_naive(np.zeros((1,1), dtype = np.uint8), [ 1000 ]), [ [ 0 ] ]))
+    assert(np.array_equal(compute_spectrum_gradient_naive(np.ones((1,1), dtype = np.uint8), [ 1000 ]), [ [ 0 ] ]))
+    assert(np.array_equal(compute_spectrum_gradient_naive(np.zeros((2,2), dtype = np.uint8), [ 512, 10 ]),
+                          [ [ 0, 0 ],
+                            [ 0, 0 ] ]))
+    assert(np.array_equal(compute_spectrum_gradient_naive(np.ones((2,2), dtype = np.uint8), [ 0, 4 ]),
+                          [ [ 0, 0 ],
+                            [ 0, 0 ] ]))
+    assert(np.array_equal(compute_spectrum_gradient_naive(
+        np.array([ [ 1, 1 ],
+                   [ 0, 0 ] ], dtype = np.uint8), [ 0, 1 ]),
+                          [ [ 0, 0 ],
+                            [ 1, 1 ] ]))
+    exit()
 
 def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
@@ -328,7 +343,7 @@ if TEST:
     try:
         print('refactored pass:')
         for _ in range(10):
-            I = np.random.randint(0, 256, size = (2**2, 2**13), dtype = np.uint8)
+            I = np.random.randint(0, 256, size = (1,1), dtype = np.uint8)
             start = time.perf_counter()
             result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, None, 2**25)
             print(time.perf_counter() - start)
