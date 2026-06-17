@@ -9,23 +9,61 @@ import galois
 import joblib
 from multiprocessing import shared_memory
 
-#TODO what should we do with zeros?
-#TODO!!! clean up + not pass 0s element around
+#TODO rewrite AS as sum of triple products, not combinations
+#TODO clean up
 
 TEST = True
 
 def double_volume(*vs):
     v0 = vs[0]
     vs = vs[1:]
+    #TODO this must be exact but looks non-exact, make it look exact e.g. via assertions
     return abs(int(np.round(np.linalg.det(
         [ 
             [ vij - v0j for vij, v0j in zip(vi, v0) ]
         for vi in vs ]))))
 
-def recompute_area_spectrum_at_zero(I, spectrum):
-    spectrum[0] = math.comb(sum(sum(int(v) for v in row) for row in I), 3) - sum(spectrum[1:])
+def get_zero_areas_count(spectrum):
+    if len(spectrum) == 0:
+        return 0
+    tail_sum = sum(spectrum[1:])
+    total_points_cube = spectrum[0] + tail_sum
+    #TODO make look exact
+    total_points_aprx = int(np.round(total_points**(1/3)))
+    return math.comb(total_points_aprx, 3) - tail_sum
 
-def compute_spectrum_naive(I):
+def compute_spectrum_by_definition(I):
+    result = math.prod(I.shape)*[int(0)]
+    grid_nodes = it.product(*[range(n) for n in I.shape])
+    simplices = it.product(grid_nodes, repeat = len(I.shape)+1)
+    for s in simplices:
+        result[double_volume(*s)] += math.prod(int(I[v]) for v in s)
+    return result
+
+if TEST:
+    assert(compute_spectrum_by_definition(np.ones((0,0), dtype = np.uint8)) == [])
+    assert(compute_spectrum_by_definition(np.ones((1,1), dtype = np.uint8)) == [ 1 ])
+    assert(compute_spectrum_by_definition(np.ones((2,1), dtype = np.uint8)) == [ 8, 0 ])
+    assert(compute_spectrum_by_definition(np.ones((1,2), dtype = np.uint8)) == [ 8, 0 ])
+    assert(compute_spectrum_by_definition(np.ones((2,2), dtype = np.uint8)) == [ 40, 24, 0, 0 ])
+    assert(compute_spectrum_by_definition(np.ones((3,2), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
+    assert(compute_spectrum_by_definition(np.ones((2,3), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
+    stretched_as = compute_spectrum_by_definition(np.array([
+        [      0,  32601,      0,     15,      0,      3,      0,       4,      0],
+        [      5,      0,      6,      0,      7,      0,     17,       0,      9],
+        [      0,     10,      0,     11,      0,     12,      0,      13,      0],
+        [     14,      0,     15,      0,     16,      0,     19,       0,2**32+1] ], dtype=np.uint64))
+    unstretched_as = compute_spectrum_by_definition(np.array([
+        [      0,      5,  32601,      0,      0,      0],
+        [     14,     10,      6,     15,      0,      0],
+        [      0,     15,     11,      7,      3,      0],
+        [      0,      0,     16,     12,     17,      4],
+        [      0,      0,      0,     19,     13,      9],
+        [      0,      0,      0,      0,2**32+1,      0]], dtype=np.uint64))
+    assert(stretched_as[::2] == unstretched_as[:len(unstretched_as)//2])
+    assert(stretched_as[1::2] == unstretched_as[len(unstretched_as)//2:] == [0]*(len(unstretched_as)//2))
+    
+def compute_spectrum_naive_parallel(I):
     rows, cols = I.shape
 
     def points_after(v0):
@@ -38,14 +76,14 @@ def compute_spectrum_naive(I):
 
     def compute_summand(v0):
         result = math.prod(I.shape)*[int(0)]
-        result[0] += math.comb(int(I[v0]), 3) # v0 == v1 == v2
+        result[0] += int(I[v0])**3 # v0 == v1 == v2
         for v2 in points_after(v0):
-            result[0] += math.comb(int(I[v0]), 2)*int(I[v2]) # v0 == v1 < v2
+            result[0] += 3*int(I[v0])**2*int(I[v2]) # v0 == v1 < v2
         for v1 in points_after(v0):
-            result[0] += int(I[v0])*math.comb(int(I[v1]), 2) # v0 < v1 == v2
+            result[0] += 3*int(I[v0])*int(I[v1])**2 # v0 < v1 == v2
             for v2 in points_after(v1):
                 area = double_volume(v0, v1, v2)
-                result[area] += math.prod(int(I[v]) for v in [ v0, v1, v2 ])
+                result[area] += 6*math.prod(int(I[v]) for v in [ v0, v1, v2 ])
 
         return result
 
@@ -60,37 +98,17 @@ def compute_spectrum_naive(I):
     return result
 
 if TEST:
-    assert(compute_spectrum_naive(np.zeros((0, 0), dtype = np.uint8)) == [ ])
-    assert(len(compute_spectrum_naive(np.zeros((1, 1), dtype = np.uint8))) == 1)
-    assert(len(compute_spectrum_naive(np.ones((1, 1), dtype = np.uint8))) == 1)
-    assert(compute_spectrum_naive(np.ones((1, 2), dtype = np.uint8))[1:] == [ 0 ])
-    assert(compute_spectrum_naive(np.ones((2, 1), dtype = np.uint8))[1:] == [ 0 ])
-    assert(compute_spectrum_naive(np.ones((2, 2), dtype = np.uint8))[1:] == [ 4, 0, 0 ])
-    assert(compute_spectrum_naive(np.ones((3, 3), dtype = np.uint8))[1:] == [ 32, 32, 4, 8, 0, 0, 0, 0 ])
-    stretched_as = compute_spectrum_naive(np.array([
-        [      0,  32601,      0,     15,      0,      3,      0,       4,      0],
-        [      5,      0,      6,      0,      7,      0,     17,       0,      9],
-        [      0,     10,      0,     11,      0,     12,      0,      13,      0],
-        [     14,      0,     15,      0,     16,      0,     19,       0,2**32+1] ], dtype=np.uint64))
-    
-    unstretched_as = compute_spectrum_naive(np.array([
-        [      0,      5,  32601,      0,      0,      0],
-        [     14,     10,      6,     15,      0,      0],
-        [      0,     15,     11,      7,      3,      0],
-        [      0,      0,     16,     12,     17,      4],
-        [      0,      0,      0,     19,     13,      9],
-        [      0,      0,      0,      0,2**32+1,      0]], dtype=np.uint64))
-    assert(len(stretched_as) == len(unstretched_as))
-    for i in range(1, len(unstretched_as)):
-        if i*2 < len(stretched_as):
-            assert(stretched_as[i*2] == unstretched_as[i])
-        else:
-            assert(unstretched_as[i] == 0)
-        if i%2 == 1:
-            assert(stretched_as[i] == 0)
+    np.random.seed(38)
+    for rows in range(9):
+        for cols in range(9):
+            for t in [ np.uint8, np.uint32, np.uint64 ]:
+                I = np.random.randint(np.iinfo(t).min, np.iinfo(t).max+1, size = (rows,cols), dtype = t)
+                reference = compute_spectrum_by_definition(I)
+                computed = compute_spectrum_naive_parallel(I)
+                assert(reference == computed)
+    exit()
 
-
-def compute_spectrum_gradient_naive(I, as_target, compute_as = compute_spectrum_naive):
+def compute_spectrum_gradient_naive(I, as_target, compute_as = compute_spectrum_naive_parallel):
     rows, cols = I.shape
     direction = [ t - v for t, v in zip(as_target, compute_as(I)) ]
     if direction:
@@ -135,7 +153,6 @@ if TEST:
                    [ 0, 0 ] ], dtype = np.uint8), [ 0, 1 ]),
                           [ [ 0, 0 ],
                             [ 1, 1 ] ]))
-    exit()
 
 def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
@@ -184,7 +201,7 @@ def get_factors_idxs(shape):
     return result, shm
 
 #TODO clean up shm handling
-def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO(NTT_I):
+def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
     dt = NTT_I.dtype
     p = NTT_I._order
@@ -285,12 +302,12 @@ def get_min_ps(p, double_spectrum_size):
     precomputed_primes[(p, double_spectrum_size)] = ps
     return ps
 
-def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None, max_p = None):
+def compute_area_spectrum_ntt(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None, max_p = None):
     rows, cols = I.shape
     spectrum_size = math.prod(I.shape)
     double_spectrum_size = 2*spectrum_size
     if p is None:
-        p = math.comb(sum(int(v) for row in I for v in row), 3)
+        p = sum(int(v) for row in I for v in row)**3
     ps = get_min_ps(p, double_spectrum_size)
     if max_p is not None and ps[-1] > max_p:
         raise RuntimeError(f'not enough primes <= {max_p} for max value {p} and ntt size {double_spectrum_size}: got {ps}')
@@ -311,9 +328,8 @@ def compute_area_spectrum_ntt_simple(I, aggregator = aggregate_area_spectrum_ntt
 
     result = [ 0 ]
     for r in it.islice(zip(*results), 1, None):
-        result.append((galois.crt(r, ps) if len(ps) > 1 else r[0])//3)
+        result.append(galois.crt(r, ps) if len(ps) > 1 else r[0])
 
-    recompute_area_spectrum_at_zero(I, result)
     return result
 
 if TEST:
@@ -323,10 +339,10 @@ if TEST:
     reference = None
     if False:
         start = time.perf_counter()
-        reference = compute_spectrum_naive(I)
+        reference = compute_spectrum_naive_parallel(I)
         print(time.perf_counter() - start)
     
-    #max_binary_as = compute_area_spectrum_ntt_simple(np.ones(I.shape, dtype = np.uint8))
+    #max_binary_as = compute_area_spectrum_ntt(np.ones(I.shape, dtype = np.uint8))
     max_as_value = None #int(np.max(I))**3*max(max_binary_as[1:])
 
     print(f'max AS value is {max_as_value}')
@@ -336,7 +352,7 @@ if TEST:
         print('unrefactored pass:')
         for i in range(3):
             start = time.perf_counter()
-            result0 = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
+            result0 = compute_area_spectrum_ntt(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
             print(time.perf_counter() - start)
 
     assert(reference is None or result0 == reference)
@@ -345,7 +361,7 @@ if TEST:
         for _ in range(10):
             I = np.random.randint(0, 256, size = (1,1), dtype = np.uint8)
             start = time.perf_counter()
-            result = compute_area_spectrum_ntt_simple(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_TODO, None, 2**25)
+            result = compute_area_spectrum_ntt(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel, None, 2**25)
             print(time.perf_counter() - start)
     finally:
         for it in factors_idxs_cache:
