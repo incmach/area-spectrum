@@ -14,6 +14,25 @@ from multiprocessing import shared_memory
 
 TEST = True
 
+def TEST_compare_methods(reference_method, method, max_size):
+    np.random.seed(38)
+    ref_timer = 0
+    method_timer = 0
+    for size in it.product(*(range(n+1) for n in max_size)):
+        for t in [ np.uint8, np.uint16, np.uint32, np.uint64 ]:
+            I = np.random.randint(np.iinfo(t).min, np.iinfo(t).max+1, size = size, dtype = t)
+
+            start = time.perf_counter()
+            reference = reference_method(I)
+            ref_timer += time.perf_counter() - start
+
+            start = time.perf_counter()
+            computed = method(I)
+            method_timer += time.perf_counter() - start
+
+            assert(reference == computed)
+    print(f'{method_timer}/{ref_timer}')
+
 def double_volume(*vs):
     v0 = vs[0]
     vs = vs[1:]
@@ -63,7 +82,7 @@ if TEST:
     assert(stretched_as[::2] == unstretched_as[:len(unstretched_as)//2])
     assert(stretched_as[1::2] == unstretched_as[len(unstretched_as)//2:] == [0]*(len(unstretched_as)//2))
     
-def compute_spectrum_naive_parallel(I):
+def compute_spectrum_by_definition_ordered_parallel(I):
     rows, cols = I.shape
 
     def points_after(v0):
@@ -98,61 +117,54 @@ def compute_spectrum_naive_parallel(I):
     return result
 
 if TEST:
-    np.random.seed(38)
-    for rows in range(9):
-        for cols in range(9):
-            for t in [ np.uint8, np.uint32, np.uint64 ]:
-                I = np.random.randint(np.iinfo(t).min, np.iinfo(t).max+1, size = (rows,cols), dtype = t)
-                reference = compute_spectrum_by_definition(I)
-                computed = compute_spectrum_naive_parallel(I)
-                assert(reference == computed)
-    exit()
+    print('definition ordered parallel')
+    TEST_compare_methods(compute_spectrum_by_definition, compute_spectrum_by_definition_ordered_parallel, (4, 8))
 
-def compute_spectrum_gradient_naive(I, as_target, compute_as = compute_spectrum_naive_parallel):
+precomputed_primes = dict()
+def get_min_ps(p, double_spectrum_size, q):
+    if (p, double_spectrum_size, q) in precomputed_primes:
+        return precomputed_primes[(p, double_spectrum_size, q)]
+    ps = []
+    while math.prod(ps) < p:
+        q = galois.next_prime(q)
+        if (q-1)%double_spectrum_size == 0:
+            ps.append(q)
+        q += 1
+    ps = tuple(ps)
+    precomputed_primes[(p, double_spectrum_size, q)] = ps
+    return ps
+
+def compute_spectrum_by_ntt(I, aggregator, p = None, max_p = None, use_crt = True):
     rows, cols = I.shape
-    direction = [ t - v for t, v in zip(as_target, compute_as(I)) ]
-    if direction:
-        direction[0] = 0
+    spectrum_size = math.prod(I.shape)
+    double_spectrum_size = 2*spectrum_size
+    if p is None:
+        p = sum(int(v) for row in I for v in row)**3
+    ps = get_min_ps(p, double_spectrum_size, 1 if use_crt else p)
+    if max_p is not None and ps[-1] > max_p:
+        raise RuntimeError(f'not enough primes <= {max_p} for max value {p} and ntt size {double_spectrum_size}: got {ps}')
 
-    def points_after(v0):
-        y0, x0 = v0
-        for x in range(x0+1, cols):
-            yield (y0, x)
-        for y in range(y0+1, rows):
-            for x in range(cols):
-                yield (y, x)
+    def f(p):
+        GF = galois.GF(p)
+        rows = I.shape[0]
+        NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
+        NTT_R = aggregator(NTT_I)
+        return [ int(v) for v in galois.intt(NTT_R)[:spectrum_size] ]
 
-    def compute_grad_element(v0):
-        return (v0,
-                sum(int(I[v1])*int(I[v2])*direction[double_volume(v0, v1, v2)]
-                    for v1 in it.product(range(rows), range(cols))
-                    for v2 in points_after(v1)))
+    if len(ps) <= 1:
+        results = [ f(p) for p in ps ]
+    else:    
+        #TODO this is method-specific?
+        get_factors_idxs((rows, double_spectrum_size))
+        results = joblib.Parallel(n_jobs=2, return_as = 'generator')(
+                joblib.delayed(f)(p)
+                for p in ps)
 
-    grad_elements = joblib.Parallel(n_jobs=16, return_as = 'generator')(
-            joblib.delayed(compute_grad_element)(v0)
-            for v0 in it.product(range(rows), range(cols)))
-    
-    result = np.zeros(I.shape, dtype = np.uint8).astype(int)
-    for v, e in grad_elements:
-        result[v] = e
+    result = [ 0 ]
+    for r in it.islice(zip(*results), 1, None):
+        result.append(galois.crt(r, ps) if len(ps) > 1 else r[0])
 
     return result
-
-if TEST:
-    assert(compute_spectrum_gradient_naive(np.zeros((0,0), dtype = np.uint8), []).shape == (0,0))
-    assert(np.array_equal(compute_spectrum_gradient_naive(np.zeros((1,1), dtype = np.uint8), [ 1000 ]), [ [ 0 ] ]))
-    assert(np.array_equal(compute_spectrum_gradient_naive(np.ones((1,1), dtype = np.uint8), [ 1000 ]), [ [ 0 ] ]))
-    assert(np.array_equal(compute_spectrum_gradient_naive(np.zeros((2,2), dtype = np.uint8), [ 512, 10 ]),
-                          [ [ 0, 0 ],
-                            [ 0, 0 ] ]))
-    assert(np.array_equal(compute_spectrum_gradient_naive(np.ones((2,2), dtype = np.uint8), [ 0, 4 ]),
-                          [ [ 0, 0 ],
-                            [ 0, 0 ] ]))
-    assert(np.array_equal(compute_spectrum_gradient_naive(
-        np.array([ [ 1, 1 ],
-                   [ 0, 0 ] ], dtype = np.uint8), [ 0, 1 ]),
-                          [ [ 0, 0 ],
-                            [ 1, 1 ] ]))
 
 def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
@@ -165,6 +177,12 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
         summand = math.prod(complement)
         NTT_R += math.prod(complement)
     return NTT_R
+
+if TEST:
+    TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
+                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, None, None, False),
+                         (4, 4))
+    exit()
 
 def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
@@ -286,87 +304,3 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
                 NTT_R[1:] += np.flip(summand[1:])
 
     return NTT_R
-
-precomputed_primes = dict()
-def get_min_ps(p, double_spectrum_size):
-    if (p, double_spectrum_size) in precomputed_primes:
-        return precomputed_primes[(p, double_spectrum_size)]
-    q = 1
-    ps = []
-    while math.prod(ps) < p:
-        q = galois.next_prime(q)
-        if (q-1)%double_spectrum_size == 0:
-            ps.append(q)
-        q += 1
-    ps = tuple(ps)
-    precomputed_primes[(p, double_spectrum_size)] = ps
-    return ps
-
-def compute_area_spectrum_ntt(I, aggregator = aggregate_area_spectrum_ntt_per_ordered_diff_pairs, p = None, max_p = None):
-    rows, cols = I.shape
-    spectrum_size = math.prod(I.shape)
-    double_spectrum_size = 2*spectrum_size
-    if p is None:
-        p = sum(int(v) for row in I for v in row)**3
-    ps = get_min_ps(p, double_spectrum_size)
-    if max_p is not None and ps[-1] > max_p:
-        raise RuntimeError(f'not enough primes <= {max_p} for max value {p} and ntt size {double_spectrum_size}: got {ps}')
-
-    print(f'{ps} -> {math.prod(ps)}/{p}')
-
-    def f(p):
-        GF = galois.GF(p)
-        rows = I.shape[0]
-        NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
-        NTT_R = aggregator(NTT_I)
-        return [ int(v) for v in galois.intt(NTT_R)[:spectrum_size] ]
-
-    get_factors_idxs((rows, double_spectrum_size))
-    results = joblib.Parallel(n_jobs=2, return_as = 'generator')(
-            joblib.delayed(f)(p)
-            for p in ps)
-
-    result = [ 0 ]
-    for r in it.islice(zip(*results), 1, None):
-        result.append(galois.crt(r, ps) if len(ps) > 1 else r[0])
-
-    return result
-
-if TEST:
-    np.random.seed(38)
-    #I = np.random.randint(0, 256, size = (8, 64), dtype = np.uint8)
-
-    reference = None
-    if False:
-        start = time.perf_counter()
-        reference = compute_spectrum_naive_parallel(I)
-        print(time.perf_counter() - start)
-    
-    #max_binary_as = compute_area_spectrum_ntt(np.ones(I.shape, dtype = np.uint8))
-    max_as_value = None #int(np.max(I))**3*max(max_binary_as[1:])
-
-    print(f'max AS value is {max_as_value}')
-    
-    result0 = None
-    if False:
-        print('unrefactored pass:')
-        for i in range(3):
-            start = time.perf_counter()
-            result0 = compute_area_spectrum_ntt(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, max_as_value)
-            print(time.perf_counter() - start)
-
-    assert(reference is None or result0 == reference)
-    try:
-        print('refactored pass:')
-        for _ in range(10):
-            I = np.random.randint(0, 256, size = (1,1), dtype = np.uint8)
-            start = time.perf_counter()
-            result = compute_area_spectrum_ntt(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel, None, 2**25)
-            print(time.perf_counter() - start)
-    finally:
-        for it in factors_idxs_cache:
-            shm = shared_memory.SharedMemory(factors_idxs_cache[it])
-            shm.close()
-            shm.unlink()
-
-    assert(result0 is None or result0 == result)
