@@ -155,7 +155,7 @@ def compute_spectrum_by_ntt(I, aggregator, p = None, max_p = None, use_crt = Tru
     def f(p):
         GF = galois.GF(p)
         rows = I.shape[0]
-        NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
+        NTT_I = GF([ galois.ntt(GF(I[r]%min(p, np.iinfo(I.dtype).max)), double_spectrum_size) for r in range(I.shape[0]) ])
 
         NTT_R = aggregator(NTT_I)
         R = galois.intt(NTT_R)
