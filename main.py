@@ -13,13 +13,16 @@ from multiprocessing import shared_memory
 #TODO clean up
 
 TEST = True
+random_seed = [ 37 ]
 
 def TEST_compare_methods(reference_method, method, max_size):
-    np.random.seed(38)
+    random_seed[0] += 1
+    np.random.seed(random_seed[0])
     ref_timer = 0
     method_timer = 0
     for size in it.product(*(range(n+1) for n in max_size)):
-        for t in [ np.uint8, np.uint16, np.uint32, np.uint64 ]:
+        for t in [ np.uint8 ]:
+            print(f'progress: {size}/{max_size}/{t}')
             I = np.random.randint(np.iinfo(t).min, np.iinfo(t).max+1, size = size, dtype = t)
 
             start = time.perf_counter()
@@ -30,7 +33,12 @@ def TEST_compare_methods(reference_method, method, max_size):
             computed = method(I)
             method_timer += time.perf_counter() - start
 
-            assert(reference == computed)
+            if reference != computed:
+                print(f'{random_seed}/{size} (of {max_size})/{t}:')
+                print(f'{reference}')
+                print(f'!=')
+                print(f'{computed}')
+                assert(False)
     print(f'{method_timer}/{ref_timer}')
 
 def double_volume(*vs):
@@ -117,7 +125,7 @@ def compute_spectrum_by_definition_ordered_parallel(I):
     return result
 
 if TEST:
-    print('definition ordered parallel')
+    print('compute_spectrum_by_definition_ordered_parallel')
     TEST_compare_methods(compute_spectrum_by_definition, compute_spectrum_by_definition_ordered_parallel, (4, 8))
 
 precomputed_primes = dict()
@@ -141,27 +149,32 @@ def compute_spectrum_by_ntt(I, aggregator, p = None, max_p = None, use_crt = Tru
     if p is None:
         p = sum(int(v) for row in I for v in row)**3
     ps = get_min_ps(p, double_spectrum_size, 1 if use_crt else p)
-    if max_p is not None and ps[-1] > max_p:
+    if max_p is not None and len(ps) > 0 and ps[-1] > max_p:
         raise RuntimeError(f'not enough primes <= {max_p} for max value {p} and ntt size {double_spectrum_size}: got {ps}')
 
     def f(p):
         GF = galois.GF(p)
         rows = I.shape[0]
         NTT_I = GF([ galois.ntt(GF(I[r]), double_spectrum_size) for r in range(I.shape[0]) ])
+
         NTT_R = aggregator(NTT_I)
-        return [ int(v) for v in galois.intt(NTT_R)[:spectrum_size] ]
+        R = galois.intt(NTT_R)
+        if len(R) > 0:
+            result = [ int(R[0]) ]
+            for u, v in zip(R[1:spectrum_size], np.flip(R[1-spectrum_size:])):
+                result.append(int(u) + int(v)) 
+                
+        return result
 
     if len(ps) <= 1:
         results = [ f(p) for p in ps ]
     else:    
-        #TODO this is method-specific?
-        get_factors_idxs((rows, double_spectrum_size))
         results = joblib.Parallel(n_jobs=2, return_as = 'generator')(
                 joblib.delayed(f)(p)
                 for p in ps)
 
-    result = [ 0 ]
-    for r in it.islice(zip(*results), 1, None):
+    result = [ ]
+    for r in zip(*results):
         result.append(galois.crt(r, ps) if len(ps) > 1 else r[0])
 
     return result
@@ -179,9 +192,14 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
     return NTT_R
 
 if TEST:
+    print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_row_triplets)')
     TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
                          lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, None, None, False),
-                         (4, 4))
+                         (4, 8))
+    print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_row_triplets, use_crt = True)')
+    TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
+                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, None, 2**20-1, True),
+                         (4, 8))
     exit()
 
 def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
