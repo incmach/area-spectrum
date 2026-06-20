@@ -12,7 +12,7 @@ from multiprocessing import shared_memory
 #TODO rewrite AS as sum of triple products, not combinations
 #TODO clean up
 
-TEST = True
+TEST = False
 random_seed = [ 37 ]
 
 def TEST_compare_methods(reference_method, method, max_size):
@@ -35,9 +35,9 @@ def TEST_compare_methods(reference_method, method, max_size):
 
             if reference != computed:
                 print(f'{random_seed}/{size} (of {max_size})/{t}:')
-                print(f'{reference}')
-                print(f'!=')
                 print(f'{computed}')
+                print(f'!=')
+                print(f'reference {reference}')
                 assert(False)
     print(f'{method_timer}/{ref_timer}')
 
@@ -189,7 +189,6 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
             NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
             for y_i in range(3)
         ]
-        summand = math.prod(complement)
         NTT_R += math.prod(complement)
     return NTT_R
 
@@ -200,9 +199,8 @@ if TEST:
                          (4, 8))
     print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_row_triplets, use_crt = True)')
     TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
-                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, None, 2**20-1, True),
+                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, None, 2**20, True),
                          (4, 8))
-    exit()
 
 def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
@@ -215,14 +213,26 @@ def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
                     NTT_I[ ys[y_i], [ k*(ys[(y_i+1)%3]-ys[(y_i+2)%3])%double_spectrum_size for k in range(double_spectrum_size) ] ]
                     for y_i in range(3)
                 ]
-                summand = 3*math.prod(complement)
+                summand = math.prod(complement)
+                if y_1 < y_3:
+                    summand *= 3
+                    if y_1 < y_2 < y_3:
+                        summand[0] *= 2
+                        summand[1:] += np.flip(summand[1:])
                 NTT_R += summand
-                if y_1 < y_2 < y_3:
-                    reverse_summand = np.zeros_like(summand)
-                    reverse_summand[0] = summand[0]
-                    reverse_summand[1:] = np.flip(summand[1:])
-                    NTT_R += reverse_summand
     return NTT_R
+
+if TEST:
+    print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_ordered_row_triplets)')
+    TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
+                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_ordered_row_triplets, None, None, False),
+                         (4, 8))
+    print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_ordered_row_triplets, use_crt = True)')
+    TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
+                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_ordered_row_triplets, None, 2**20, True),
+                         (4, 8))
+
+exit()
 
 factors_idxs_cache = dict()
 def get_factors_idxs(shape):
