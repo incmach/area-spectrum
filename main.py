@@ -272,7 +272,7 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
 
     return NTT_R
 
-if True:
+if TEST:
     print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_ordered_diff_pairs)')
     TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
                          lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, None, None, False),
@@ -281,8 +281,6 @@ if True:
     TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
                          lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, None, 2**20, True),
                          (4, 8))
-
-exit()
 
 factors_idxs_cache = dict()
 def get_factors_idxs(shape):
@@ -300,16 +298,17 @@ def get_factors_idxs(shape):
 
 #TODO clean up shm handling
 def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel(NTT_I):
+
     rows, double_spectrum_size = NTT_I.shape
     dt = NTT_I.dtype
+    if dt not in [ np.uint8, np.uint16, np.uint32, np.uint64 ]:
+        raise RuntimeError('Unable to marshall the ntt with given datatype. Please use CRT')
     p = NTT_I._order
 
     NTT_I_T_shm = shared_memory.SharedMemory(create = True, size = NTT_I.nbytes)
     NTT_I_T_shm_name = NTT_I_T_shm.name
     NTT_I_T = np.ndarray((double_spectrum_size, rows), dtype = dt, buffer = NTT_I_T_shm.buf)
     NTT_I_T[:,:] = NTT_I.T
-
-    get_factors_idxs(NTT_I.shape)
 
     def compute_area_spectrum_summand(d_12):
         NTT_I_T_shm = shared_memory.SharedMemory(NTT_I_T_shm_name)
@@ -319,13 +318,15 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel(NTT_I):
         result = np.zeros_like(NTT_I_T[:,0])
         for d_23 in range(1-rows-d_12, 1):
             y_max = rows+d_12+d_23
-            summand = 3*np.sum(
+            summand = np.sum(
                       math.prod(NTT_I_T[all_factors_idxs[i],lower:upper] for (i, lower, upper) in
                       [ (d_23, 0, y_max), (-d_12-d_23, -d_12, y_max-d_12), (d_12, -d_12-d_23, rows) ]),
                 axis = 1)
-            if d_12 != 0 and d_23 != 0:
-                summand[0] *= 2
-                summand[1:] += np.flip(summand[1:])
+            if d_12 != 0 or d_23 != 0:
+                summand *= 3
+                if d_12 != 0 and d_23 != 0:
+                    summand[0] *= 2
+                    summand[1:] += np.flip(summand[1:])
             result += summand
         closeable.close()
         NTT_I_T_shm.close()
@@ -346,4 +347,13 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel(NTT_I):
 
     return result
 
+if True:
+    print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel)')
+    TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
+                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel, None, None, False),
+                         (3, 3))
+    print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel, use_crt = True)')
+    TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
+                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel, None, 2**30, True),
+                         (4, 8))
 
