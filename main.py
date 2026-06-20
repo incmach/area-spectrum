@@ -232,6 +232,56 @@ if TEST:
                          lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_ordered_row_triplets, None, 2**20, True),
                          (4, 8))
 
+factors_1_2_idxs_cache = dict()
+factors_3_idxs_cache = dict()
+def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
+    NTT_I_T = NTT_I.T
+    rows, double_spectrum_size = NTT_I.shape
+    NTT_R = np.zeros_like(NTT_I[0])
+
+    for d_12 in range(-(rows-1), 1):
+        if (double_spectrum_size, d_12) in factors_3_idxs_cache:
+            factors_3_idxs = factors_3_idxs_cache[(double_spectrum_size, d_12)]
+        else:
+            factors_3_idxs = [k*d_12%double_spectrum_size for k in range(double_spectrum_size) ]
+            factors_3_idxs_cache[(double_spectrum_size, d_12)] = factors_3_idxs
+        factors_3 = NTT_I_T[ factors_3_idxs, : ]
+        for d_23 in range(-(rows-1) - d_12, 1):
+            y_max = rows+d_12+d_23
+
+            if (double_spectrum_size, d_12, d_23) in factors_1_2_idxs_cache:
+                factors_1_idxs, factors_2_idxs = factors_1_2_idxs_cache[(double_spectrum_size, d_12, d_23)]
+            else:
+                factors_1_idxs = [k*d_23%double_spectrum_size for k in range(double_spectrum_size) ]
+                factors_2_idxs = [k*(-d_12-d_23)%double_spectrum_size for k in range(double_spectrum_size) ]
+                factors_1_2_idxs_cache[(double_spectrum_size, d_12, d_23)] = (factors_1_idxs, factors_2_idxs)
+
+            factors_1 = NTT_I_T[ factors_1_idxs, :y_max ]
+            factors_2 = NTT_I_T[ factors_2_idxs, -d_12:y_max-d_12 ]
+            
+            summand = np.sum(
+                factors_1*factors_2*factors_3[:,-d_12-d_23:y_max-d_12-d_23],
+                axis = 1)
+            if d_12 != 0 or d_23 != 0:
+                summand *= 3
+                if d_12 != 0 and d_23 != 0:
+                    summand[0] *= 2
+                    summand[1:] += np.flip(summand[1:])
+
+            NTT_R += summand
+
+    return NTT_R
+
+if True:
+    print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_ordered_diff_pairs)')
+    TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
+                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, None, None, False),
+                         (4, 8))
+    print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_ordered_diff_pairs, use_crt = True)')
+    TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
+                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs, None, 2**20, True),
+                         (4, 8))
+
 exit()
 
 factors_idxs_cache = dict()
@@ -296,41 +346,4 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel(NTT_I):
 
     return result
 
-factors_1_2_idxs_cache = dict()
-factors_3_idxs_cache = dict()
 
-def aggregate_area_spectrum_ntt_per_ordered_diff_pairs(NTT_I):
-    NTT_I_T = NTT_I.T
-    rows, double_spectrum_size = NTT_I.shape
-    NTT_R = np.zeros_like(NTT_I[0])
-
-    for d_12 in range(-(rows-1), 1):
-        if (double_spectrum_size, d_12) in factors_3_idxs_cache:
-            factors_3_idxs = factors_3_idxs_cache[(double_spectrum_size, d_12)]
-        else:
-            factors_3_idxs = [k*d_12%double_spectrum_size for k in range(double_spectrum_size) ]
-            factors_3_idxs_cache[(double_spectrum_size, d_12)] = factors_3_idxs
-        factors_3 = NTT_I_T[ factors_3_idxs, : ]
-        for d_23 in range(-(rows-1) - d_12, 1):
-            y_max = rows+d_12+d_23
-
-            if (double_spectrum_size, d_12, d_23) in factors_1_2_idxs_cache:
-                factors_1_idxs, factors_2_idxs = factors_1_2_idxs_cache[(double_spectrum_size, d_12, d_23)]
-            else:
-                factors_1_idxs = [k*d_23%double_spectrum_size for k in range(double_spectrum_size) ]
-                factors_2_idxs = [k*(-d_12-d_23)%double_spectrum_size for k in range(double_spectrum_size) ]
-                factors_1_2_idxs_cache[(double_spectrum_size, d_12, d_23)] = (factors_1_idxs, factors_2_idxs)
-
-            factors_1 = NTT_I_T[ factors_1_idxs, :y_max ]
-            factors_2 = NTT_I_T[ factors_2_idxs, -d_12:y_max-d_12 ]
-            
-            summand = 3*np.sum(
-                factors_1*factors_2*factors_3[:,-d_12-d_23:y_max-d_12-d_23],
-                axis = 1)
-
-            NTT_R += summand
-            if d_12 != 0 and d_23 != 0:
-                NTT_R[0] += summand[0]
-                NTT_R[1:] += np.flip(summand[1:])
-
-    return NTT_R
