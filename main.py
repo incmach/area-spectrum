@@ -9,20 +9,22 @@ import galois
 import joblib
 from multiprocessing import shared_memory
 
+#TODO computing a field for a prime seems very resource-heavy. That's a problem when parallelising. We can do related multiprocessing ourselves to avoid recomputation. The good news is that our fastest methods must get even faster
 #TODO rewrite AS as sum of triple products, not combinations
 #TODO clean up
 
 TEST = False
 random_seed = [ 37 ]
 
-def TEST_compare_methods(reference_method, method, max_size):
+def TEST_compare_methods(reference_method, method, sizes):
     random_seed[0] += 1
     np.random.seed(random_seed[0])
     ref_timer = 0
     method_timer = 0
-    for size in it.product(*(range(n+1) for n in max_size)):
+    for size_i, size in enumerate(sizes):
+    #for size in it.product(*(range(n+1) for n in max_size)):
         for t in [ np.uint8 ]:
-            print(f'progress: {size}/{max_size}/{t}')
+            print(f'progress: {size} ({size_i}/{len(sizes)}), type {t}')
             I = np.random.randint(np.iinfo(t).min, np.iinfo(t).max+1, size = size, dtype = t)
 
             start = time.perf_counter()
@@ -34,12 +36,12 @@ def TEST_compare_methods(reference_method, method, max_size):
             method_timer += time.perf_counter() - start
 
             if reference != computed:
-                print(f'{random_seed}/{size} (of {max_size})/{t}:')
+                print(f'{random_seed}, {size} ({size_i}/{len(sizes)}), {t}:')
                 print(f'{computed}')
                 print(f'!=')
                 print(f'reference {reference}')
                 assert(False)
-    print(f'{method_timer}/{ref_timer}')
+    print(f'{method_timer/len(sizes)}/reference {ref_timer/len(sizes)}')
 
 def double_volume(*vs):
     v0 = vs[0]
@@ -168,7 +170,7 @@ def compute_spectrum_by_ntt(I, aggregator, p = None, max_p = None, use_crt = Tru
                 
         return result
 
-    if len(ps) <= 1:
+    if False:
         results = [ f(p) for p in ps ]
     else:    
         results = joblib.Parallel(n_jobs=2, return_as = 'generator')(
@@ -192,15 +194,16 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
         NTT_R += math.prod(complement)
     return NTT_R
 
-if TEST:
+if True:
     print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_row_triplets)')
     TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
-                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, None, None, False),
-                         (4, 8))
+                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, (255*8*32)**3, 2**16, True),
+                         [(8, 32)])
     print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_row_triplets, use_crt = True)')
     TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
-                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, None, 2**20, True),
-                         (4, 8))
+                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, (255*8*32)**3, 2**16, True),
+                         [(8, 32)]*16)
+exit()
 
 def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
@@ -347,7 +350,7 @@ def aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel(NTT_I):
 
     return result
 
-if True:
+if TEST:
     print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel)')
     TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
                          lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_ordered_diff_pairs_parallel, None, None, False),
