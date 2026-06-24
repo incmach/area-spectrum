@@ -6,8 +6,11 @@ import time
 import numpy as np
 import galois
 
+import multiprocessing
+multiprocessing.set_start_method('fork')
 import joblib
-from multiprocessing import shared_memory
+with joblib.parallel_config(backend='multiprocessing', make_default=True):
+    pass
 
 #TODO computing a field for a prime seems very resource-heavy. That's a problem when parallelising. We can do related multiprocessing ourselves to avoid recomputation. The good news is that our fastest methods must get even faster
 #TODO rewrite AS as sum of triple products, not combinations
@@ -131,6 +134,7 @@ if TEST:
     TEST_compare_methods(compute_spectrum_by_definition, compute_spectrum_by_definition_ordered_parallel, (4, 8))
 
 precomputed_primes = dict()
+precomputed_GFs = dict()
 def get_min_ps(p, double_spectrum_size, q):
     if (p, double_spectrum_size, q) in precomputed_primes:
         return precomputed_primes[(p, double_spectrum_size, q)]
@@ -142,7 +146,32 @@ def get_min_ps(p, double_spectrum_size, q):
         q += 1
     ps = tuple(ps)
     precomputed_primes[(p, double_spectrum_size, q)] = ps
+    for p in ps:
+        if p not in precomputed_GFs:
+            precomputed_GFs[p] = galois.GF(p)
+
     return ps
+
+wip_Is = [  ]
+def compute_spectrum_modulo_p_by_ntt(p, wip_I_idx, aggregator):
+    GF = precomputed_GFs[p]
+    I = wip_Is[wip_I_idx]
+    spectrum_size = math.prod(I.shape)
+    double_spectrum_size = 2*spectrum_size
+    rows = I.shape[0]
+    NTT_I = GF([
+        galois.ntt(GF(I[r] if p > np.iinfo(I.dtype).max else I[r]%p), double_spectrum_size)
+        for r in range(I.shape[0]) ])
+
+    NTT_R = aggregator(NTT_I)
+    R = galois.intt(NTT_R)
+    if len(R) > 0:
+        result = [ int(R[0]) ]
+        for u, v in zip(R[1:spectrum_size], np.flip(R[1-spectrum_size:])):
+            result.append(int(u) + int(v)) 
+            
+    return result
+
 
 def compute_spectrum_by_ntt(I, aggregator, p = None, max_p = None, use_crt = True):
     rows, cols = I.shape
@@ -154,28 +183,15 @@ def compute_spectrum_by_ntt(I, aggregator, p = None, max_p = None, use_crt = Tru
     if max_p is not None and len(ps) > 0 and ps[-1] > max_p:
         raise RuntimeError(f'not enough primes <= {max_p} for max value {p} and ntt size {double_spectrum_size}: got {ps}')
 
-    def f(p):
-        GF = galois.GF(p)
-        rows = I.shape[0]
-        NTT_I = GF([
-            galois.ntt(GF(I[r] if p > np.iinfo(I.dtype).max else I[r]%p), double_spectrum_size)
-            for r in range(I.shape[0]) ])
-
-        NTT_R = aggregator(NTT_I)
-        R = galois.intt(NTT_R)
-        if len(R) > 0:
-            result = [ int(R[0]) ]
-            for u, v in zip(R[1:spectrum_size], np.flip(R[1-spectrum_size:])):
-                result.append(int(u) + int(v)) 
-                
-        return result
-
     if False:
         results = [ f(p) for p in ps ]
     else:    
-        results = joblib.Parallel(n_jobs=2, return_as = 'generator')(
-                joblib.delayed(f)(p)
+        wip_I_idx = len(wip_Is)
+        wip_Is.append(I)
+        results = joblib.Parallel(n_jobs=16, backend = 'multiprocessing')(
+                joblib.delayed(compute_spectrum_modulo_p_by_ntt)(p, wip_I_idx, aggregator)
                 for p in ps)
+        del wip_Is[wip_I_idx]
 
     result = [ ]
     for r in zip(*results):
