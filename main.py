@@ -12,6 +12,9 @@ import joblib
 with joblib.parallel_config(backend='multiprocessing', make_default=True):
     pass
 
+from compute_area_spectrum.by_definition.common import double_volume
+from compute_area_spectrum.by_definition.direct import f as compute_spectrum_by_definition
+
 #TODO computing a field for a prime seems very resource-heavy. That's a problem when parallelising. We can do related multiprocessing ourselves to avoid recomputation. The good news is that our fastest methods must get even faster
 #TODO rewrite AS as sum of triple products, not combinations
 #TODO clean up
@@ -27,7 +30,7 @@ def TEST_compare_methods(reference_method, method, sizes):
     for size_i, size in enumerate(sizes):
     #for size in it.product(*(range(n+1) for n in max_size)):
         for t in [ np.uint8 ]:
-            print(f'progress: {size} ({size_i}/{len(sizes)}), type {t}')
+            print(f'progress: {size} ({size_i+1}/{len(sizes)}), type {t}')
             I = np.random.randint(np.iinfo(t).min, np.iinfo(t).max+1, size = size, dtype = t)
 
             start = time.perf_counter()
@@ -46,15 +49,6 @@ def TEST_compare_methods(reference_method, method, sizes):
                 assert(False)
     print(f'{method_timer/len(sizes)}/reference {ref_timer/len(sizes)}')
 
-def double_volume(*vs):
-    v0 = vs[0]
-    vs = vs[1:]
-    #TODO this must be exact but looks non-exact, make it look exact e.g. via assertions
-    return abs(int(np.round(np.linalg.det(
-        [ 
-            [ vij - v0j for vij, v0j in zip(vi, v0) ]
-        for vi in vs ]))))
-
 def get_zero_areas_count(spectrum):
     if len(spectrum) == 0:
         return 0
@@ -64,37 +58,6 @@ def get_zero_areas_count(spectrum):
     total_points_aprx = int(np.round(total_points**(1/3)))
     return math.comb(total_points_aprx, 3) - tail_sum
 
-def compute_spectrum_by_definition(I):
-    result = math.prod(I.shape)*[int(0)]
-    grid_nodes = it.product(*[range(n) for n in I.shape])
-    simplices = it.product(grid_nodes, repeat = len(I.shape)+1)
-    for s in simplices:
-        result[double_volume(*s)] += math.prod(int(I[v]) for v in s)
-    return result
-
-if TEST:
-    assert(compute_spectrum_by_definition(np.ones((0,0), dtype = np.uint8)) == [])
-    assert(compute_spectrum_by_definition(np.ones((1,1), dtype = np.uint8)) == [ 1 ])
-    assert(compute_spectrum_by_definition(np.ones((2,1), dtype = np.uint8)) == [ 8, 0 ])
-    assert(compute_spectrum_by_definition(np.ones((1,2), dtype = np.uint8)) == [ 8, 0 ])
-    assert(compute_spectrum_by_definition(np.ones((2,2), dtype = np.uint8)) == [ 40, 24, 0, 0 ])
-    assert(compute_spectrum_by_definition(np.ones((3,2), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
-    assert(compute_spectrum_by_definition(np.ones((2,3), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
-    stretched_as = compute_spectrum_by_definition(np.array([
-        [      0,  32601,      0,     15,      0,      3,      0,       4,      0],
-        [      5,      0,      6,      0,      7,      0,     17,       0,      9],
-        [      0,     10,      0,     11,      0,     12,      0,      13,      0],
-        [     14,      0,     15,      0,     16,      0,     19,       0,2**32+1] ], dtype=np.uint64))
-    unstretched_as = compute_spectrum_by_definition(np.array([
-        [      0,      5,  32601,      0,      0,      0],
-        [     14,     10,      6,     15,      0,      0],
-        [      0,     15,     11,      7,      3,      0],
-        [      0,      0,     16,     12,     17,      4],
-        [      0,      0,      0,     19,     13,      9],
-        [      0,      0,      0,      0,2**32+1,      0]], dtype=np.uint64))
-    assert(stretched_as[::2] == unstretched_as[:len(unstretched_as)//2])
-    assert(stretched_as[1::2] == unstretched_as[len(unstretched_as)//2:] == [0]*(len(unstretched_as)//2))
-    
 def compute_spectrum_by_definition_ordered_parallel(I):
     rows, cols = I.shape
 
