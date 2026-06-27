@@ -9,14 +9,11 @@ import galois
 import multiprocessing
 multiprocessing.set_start_method('fork')
 import joblib
-with joblib.parallel_config(backend='multiprocessing', make_default=True):
-    pass
 
 from compute_area_spectrum.by_definition.common import double_volume
 from compute_area_spectrum.by_definition.direct import f as compute_spectrum_by_definition
+from compute_area_spectrum.by_definition.parallel_in_triangles import f as compute_spectrum_by_definition_ordered_parallel
 
-#TODO computing a field for a prime seems very resource-heavy. That's a problem when parallelising. We can do related multiprocessing ourselves to avoid recomputation. The good news is that our fastest methods must get even faster
-#TODO rewrite AS as sum of triple products, not combinations
 #TODO clean up
 
 TEST = False
@@ -57,44 +54,6 @@ def get_zero_areas_count(spectrum):
     #TODO make look exact
     total_points_aprx = int(np.round(total_points**(1/3)))
     return math.comb(total_points_aprx, 3) - tail_sum
-
-def compute_spectrum_by_definition_ordered_parallel(I):
-    rows, cols = I.shape
-
-    def points_after(v0):
-        y0, x0 = v0
-        for x in range(x0+1, cols):
-            yield (y0, x)
-        for y in range(y0+1, rows):
-            for x in range(cols):
-                yield (y, x)
-
-    def compute_summand(v0):
-        result = math.prod(I.shape)*[int(0)]
-        result[0] += int(I[v0])**3 # v0 == v1 == v2
-        for v2 in points_after(v0):
-            result[0] += 3*int(I[v0])**2*int(I[v2]) # v0 == v1 < v2
-        for v1 in points_after(v0):
-            result[0] += 3*int(I[v0])*int(I[v1])**2 # v0 < v1 == v2
-            for v2 in points_after(v1):
-                area = double_volume(v0, v1, v2)
-                result[area] += 6*math.prod(int(I[v]) for v in [ v0, v1, v2 ])
-
-        return result
-
-    summands = joblib.Parallel(n_jobs=16, return_as = 'generator')(
-            joblib.delayed(compute_summand)(v0)
-            for v0 in it.product(range(rows), range(cols)))
-    result = math.prod(I.shape)*[int(0)]
-    for s in summands:
-        for i, v in enumerate(result):
-            result[i] += s[i]
-
-    return result
-
-if TEST:
-    print('compute_spectrum_by_definition_ordered_parallel')
-    TEST_compare_methods(compute_spectrum_by_definition, compute_spectrum_by_definition_ordered_parallel, (4, 8))
 
 precomputed_primes = dict()
 precomputed_GFs = dict()
@@ -173,7 +132,7 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
         NTT_R += math.prod(complement)
     return NTT_R
 
-if True:
+if TEST:
     print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_row_triplets)')
     TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
                          lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, (255*8*32)**3, 2**16, True),
