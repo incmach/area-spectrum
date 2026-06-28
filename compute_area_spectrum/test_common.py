@@ -1,7 +1,7 @@
 import numpy as np
 import time
 
-from . import direct
+from .by_definition import direct
 
 def TEST_method(method, sizes, random_seed = 38, reference_method = direct.f):
     np.random.seed(random_seed)

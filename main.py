@@ -17,43 +17,6 @@ from compute_area_spectrum.by_definition.parallel_in_triangles import f as compu
 #TODO clean up
 
 TEST = False
-random_seed = [ 37 ]
-
-def TEST_compare_methods(reference_method, method, sizes):
-    random_seed[0] += 1
-    np.random.seed(random_seed[0])
-    ref_timer = 0
-    method_timer = 0
-    for size_i, size in enumerate(sizes):
-    #for size in it.product(*(range(n+1) for n in max_size)):
-        for t in [ np.uint8 ]:
-            print(f'progress: {size} ({size_i+1}/{len(sizes)}), type {t}')
-            I = np.random.randint(np.iinfo(t).min, np.iinfo(t).max+1, size = size, dtype = t)
-
-            start = time.perf_counter()
-            reference = reference_method(I)
-            ref_timer += time.perf_counter() - start
-
-            start = time.perf_counter()
-            computed = method(I)
-            method_timer += time.perf_counter() - start
-
-            if reference != computed:
-                print(f'{random_seed}, {size} ({size_i}/{len(sizes)}), {t}:')
-                print(f'{computed}')
-                print(f'!=')
-                print(f'reference {reference}')
-                assert(False)
-    print(f'{method_timer/len(sizes)}/reference {ref_timer/len(sizes)}')
-
-def get_zero_areas_count(spectrum):
-    if len(spectrum) == 0:
-        return 0
-    tail_sum = sum(spectrum[1:])
-    total_points_cube = spectrum[0] + tail_sum
-    #TODO make look exact
-    total_points_aprx = int(np.round(total_points**(1/3)))
-    return math.comb(total_points_aprx, 3) - tail_sum
 
 precomputed_primes = dict()
 precomputed_GFs = dict()
