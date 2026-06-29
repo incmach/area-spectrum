@@ -7,40 +7,22 @@ import numpy as np
 import galois
 
 import multiprocessing
-multiprocessing.set_start_method('fork')
 import joblib
 
 from compute_area_spectrum.by_definition.common import double_volume
 from compute_area_spectrum.by_definition.direct import f as compute_spectrum_by_definition
 from compute_area_spectrum.by_definition.parallel_in_triangles import f as compute_spectrum_by_definition_ordered_parallel
+from compute_area_spectrum.aggregate_per_p_then_crt import f as compute_spectrum_by_ntt
+
+from compute_area_spectrum.test_common import TEST_method
 
 #TODO clean up
+#TODO ideally, each method definition should be a chain of commands
 
 TEST = False
 
-precomputed_primes = dict()
-precomputed_GFs = dict()
-def get_min_ps(p, double_spectrum_size, q):
-    if (p, double_spectrum_size, q) in precomputed_primes:
-        return precomputed_primes[(p, double_spectrum_size, q)]
-    ps = []
-    while math.prod(ps) < p:
-        q = galois.next_prime(q)
-        if (q-1)%double_spectrum_size == 0:
-            ps.append(q)
-        q += 1
-    ps = tuple(ps)
-    precomputed_primes[(p, double_spectrum_size, q)] = ps
-    for p in ps:
-        if p not in precomputed_GFs:
-            precomputed_GFs[p] = galois.GF(p)
-
-    return ps
-
-wip_Is = [  ]
-def compute_spectrum_modulo_p_by_ntt(p, wip_I_idx, aggregator):
-    GF = precomputed_GFs[p]
-    I = wip_Is[wip_I_idx]
+def compute_spectrum_modulo_p_by_ntt(aggregator, p, I):
+    GF = galois.GF(p)
     spectrum_size = math.prod(I.shape)
     double_spectrum_size = 2*spectrum_size
     rows = I.shape[0]
@@ -57,33 +39,6 @@ def compute_spectrum_modulo_p_by_ntt(p, wip_I_idx, aggregator):
             
     return result
 
-
-def compute_spectrum_by_ntt(I, aggregator, p = None, max_p = None, use_crt = True):
-    rows, cols = I.shape
-    spectrum_size = math.prod(I.shape)
-    double_spectrum_size = 2*spectrum_size
-    if p is None:
-        p = sum(int(v) for row in I for v in row)**3
-    ps = get_min_ps(p, double_spectrum_size, 1 if use_crt else p)
-    if max_p is not None and len(ps) > 0 and ps[-1] > max_p:
-        raise RuntimeError(f'not enough primes <= {max_p} for max value {p} and ntt size {double_spectrum_size}: got {ps}')
-
-    if False:
-        results = [ f(p) for p in ps ]
-    else:    
-        wip_I_idx = len(wip_Is)
-        wip_Is.append(I)
-        results = joblib.Parallel(n_jobs=16, backend = 'multiprocessing')(
-                joblib.delayed(compute_spectrum_modulo_p_by_ntt)(p, wip_I_idx, aggregator)
-                for p in ps)
-        del wip_Is[wip_I_idx]
-
-    result = [ ]
-    for r in zip(*results):
-        result.append(galois.crt(r, ps) if len(ps) > 1 else r[0])
-
-    return result
-
 def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
     NTT_R = np.zeros_like(NTT_I[0])
@@ -95,16 +50,14 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
         NTT_R += math.prod(complement)
     return NTT_R
 
-if TEST:
+if True:
     print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_row_triplets)')
-    TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
-                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, (255*8*32)**3, 2**16, True),
-                         [(8, 32)])
-    print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_row_triplets, use_crt = True)')
-    TEST_compare_methods(compute_spectrum_by_definition_ordered_parallel,
-                         lambda I: compute_spectrum_by_ntt(I, aggregate_area_spectrum_ntt_per_row_triplets, (255*8*32)**3, 2**16, True),
-                         [(8, 32)]*16)
-exit()
+    TEST_method(lambda I: compute_spectrum_by_ntt(I,
+                                                  ft.partial(compute_spectrum_modulo_p_by_ntt,
+                                                             aggregate_area_spectrum_ntt_per_row_triplets),
+                                                  (8*8*255)^3, 2**20, False),
+                #TODO range(0,
+                list(it.product(*(range(1, n+1) for n in (8,8)))))
 
 def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
