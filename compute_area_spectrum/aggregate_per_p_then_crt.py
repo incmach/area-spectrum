@@ -33,9 +33,8 @@ def f(I, per_p_f, p = None, max_p = None, use_crt = True):
     spectrum_size = math.prod(I.shape)
     double_spectrum_size = 2*spectrum_size
     if p is None:
-        p = (np.iinfo(I.dtype).max*spectrum_size)**3
+        p = (np.iinfo(I.dtype).max*rows*cols)**3
     ps = get_min_ps(p, double_spectrum_size, 1 if use_crt else p)
-    print(ps)
     if max_p is not None and len(ps) > 0 and ps[-1] > max_p:
         raise RuntimeError(f'not enough primes <= {max_p} for max value {p} and ntt size {double_spectrum_size}: got {ps}')
 

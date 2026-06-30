@@ -55,7 +55,7 @@ if True:
     TEST_method(lambda I: compute_spectrum_by_ntt(I,
                                                   ft.partial(compute_spectrum_modulo_p_by_ntt,
                                                              aggregate_area_spectrum_ntt_per_row_triplets),
-                                                  (8*8*255)^3, 2**20, False),
+                                                  (8*8*255)**3, None, False),
                 #TODO range(0,
                 list(it.product(*(range(1, n+1) for n in (8,8)))))
 
