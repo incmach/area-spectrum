@@ -11,11 +11,12 @@ def get_min_ps(p, double_spectrum_size, q):
     if (p, double_spectrum_size, q) in precomputed_primes:
         return precomputed_primes[(p, double_spectrum_size, q)]
     ps = []
-    while math.prod(ps) < p:
-        q = galois.next_prime(q)
-        if (q-1)%double_spectrum_size == 0:
-            ps.append(q)
-        q += 1
+    if double_spectrum_size != 0:
+        while math.prod(ps) < p:
+            q = galois.next_prime(q)
+            if (q-1)%double_spectrum_size == 0:
+                ps.append(q)
+            q += 1
     ps = tuple(ps)
     precomputed_primes[(p, double_spectrum_size, q)] = ps
     for p in ps:

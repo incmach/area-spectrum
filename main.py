@@ -17,7 +17,7 @@ from compute_area_spectrum.aggregate_per_p_then_crt import f as compute_spectrum
 from compute_area_spectrum.test_common import TEST_method
 
 #TODO clean up
-#TODO ideally, each method definition should be a chain of commands
+#TODO ideally, each method definition should be a formulaic chain of functions
 
 TEST = False
 
@@ -56,8 +56,9 @@ if True:
                                                   ft.partial(compute_spectrum_modulo_p_by_ntt,
                                                              aggregate_area_spectrum_ntt_per_row_triplets),
                                                   (8*8*255)**3, None, False),
-                #TODO range(0,
-                list(it.product(*(range(1, n+1) for n in (8,8)))))
+                list(it.product(*(range(n+1) for n in (8,8)))),
+                38,
+                compute_spectrum_by_definition_ordered_parallel)
 
 def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape
