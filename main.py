@@ -21,14 +21,15 @@ from compute_area_spectrum.test_common import TEST_method
 
 TEST = False
 
-def compute_spectrum_modulo_p_by_ntt(aggregator, p, I):
-    GF = galois.GF(p)
+def compute_spectrum_in_GF_by_ntt(aggregator, GF, I):
+    p = GF.order
     spectrum_size = math.prod(I.shape)
     double_spectrum_size = 2*spectrum_size
     rows = I.shape[0]
     NTT_I = GF([
         galois.ntt(GF(I[r] if p > np.iinfo(I.dtype).max else I[r]%p), double_spectrum_size)
-        for r in range(I.shape[0]) ])
+        for r in range(I.shape[0])
+    ])
 
     NTT_R = aggregator(NTT_I)
     R = galois.intt(NTT_R)
@@ -51,14 +52,28 @@ def aggregate_area_spectrum_ntt_per_row_triplets(NTT_I):
     return NTT_R
 
 if True:
+    I | enumerate | triplets | group-by v | v, sum(value)
+    min_ps(I) | for p in . (
+        NTT(row) for row in I | enumerate | triplets | triple-cross-correlation-projection for t in . | sum | INTT
+    ) | CRT
     print('compute_spectrum_by_ntt(aggregate_area_spectrum_ntt_per_row_triplets)')
-    TEST_method(lambda I: compute_spectrum_by_ntt(I,
-                                                  ft.partial(compute_spectrum_modulo_p_by_ntt,
-                                                             aggregate_area_spectrum_ntt_per_row_triplets),
-                                                  (8*8*255)**3, None, False),
-                list(it.product(*(range(n+1) for n in (8,8)))),
+
+    m = lambda use_crt, I : compute_spectrum_by_ntt(I,
+                                                    ft.partial(compute_spectrum_in_GF_by_ntt,
+                                                               aggregate_area_spectrum_ntt_per_row_triplets),
+                                                    None, None, use_crt)
+    TEST_method(ft.partial(m, False),
+                [(8,8)],
                 38,
                 compute_spectrum_by_definition_ordered_parallel)
+    m(False, np.ones((8,16), dtype = np.uint8))
+    print('precomputed non-crt')
+    m(True, np.ones((8,16), dtype = np.uint8))
+    print('precomputed crt')
+    TEST_method(ft.partial(m, True),
+                [(8,16)]*256,
+                39,
+                ft.partial(m, False))
 
 def aggregate_area_spectrum_ntt_per_ordered_row_triplets(NTT_I):
     rows, double_spectrum_size = NTT_I.shape

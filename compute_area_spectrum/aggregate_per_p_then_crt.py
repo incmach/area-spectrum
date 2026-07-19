@@ -26,8 +26,8 @@ def get_min_ps(p, double_spectrum_size, q):
     return ps
 
 _images = dict()
-def call_per_p_f(per_p_f, p, key):
-    return per_p_f(p, _images[key])
+def call_per_p_f(per_p_f, GF_key, image_key):
+    return per_p_f(precomputed_GFs[GF_key], _images[image_key])
 
 def f(I, per_p_f, p = None, max_p = None, use_crt = True):
     rows, cols = I.shape
@@ -40,7 +40,7 @@ def f(I, per_p_f, p = None, max_p = None, use_crt = True):
         raise RuntimeError(f'not enough primes <= {max_p} for max value {p} and ntt size {double_spectrum_size}: got {ps}')
 
     if len(ps) <= 16:
-        results = [ per_p_f(p, I) for p in ps ]
+        results = [ per_p_f(galois.GF(p), I) for p in ps ]
     else:    
         key = uuid.uuid4()
         _images[key] = I
