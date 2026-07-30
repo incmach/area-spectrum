@@ -3,6 +3,7 @@ import itertools as it
 import math
 import numpy as np
 import sympy
+import galois
 
 _volume_fs = dict()
 def double_volume(*vs):
@@ -15,7 +16,7 @@ def double_volume(*vs):
         _volume_fs[len(vs)] = f
     return f(*it.chain.from_iterable(vs))
 
-def compute_spectrum_by_definition(I):
+def compute_area_spectrum_by_definition(I):
     result = math.prod(I.shape)*[int(0)]
     grid_nodes = it.product(*[range(n) for n in I.shape])
     simplices = it.product(grid_nodes, repeat = len(I.shape)+1)
@@ -23,20 +24,37 @@ def compute_spectrum_by_definition(I):
         result[double_volume(*s)] += math.prod(int(I[v]) for v in s)
     return result
 
+#triple correlation
+def compute_area_spectrum_via_triple_correlation(I):
+    rows, cols = I.shape
+    I_p = np.pad(I, tuple((n//2, n//2) for n in I.shape), constant_values = GF(0))
+    for d_12 in it.product(*(np.range(n) for n in I.shape)):
+        J = I*np.roll(I_p, d_12, (0, 1))
+        triple_spectrum_section = np.intt(np.ntt(J)*np.ntt(I_p))[rows:1-rows, cols:1-cols]
+        ys = np.arange(rows)
+        xs = np.arange(cols)
+        dy, dx = d_12
+        bins = dy*xs.reshape(1, -1) - dx*ys.reshape(-1, 1)
+
+        
+
+#TODO test_new_main.py
+
 if True:
-    assert(compute_spectrum_by_definition(np.ones((0,0), dtype = np.uint8)) == [])
-    assert(compute_spectrum_by_definition(np.ones((1,1), dtype = np.uint8)) == [ 1 ])
-    assert(compute_spectrum_by_definition(np.ones((2,1), dtype = np.uint8)) == [ 8, 0 ])
-    assert(compute_spectrum_by_definition(np.ones((1,2), dtype = np.uint8)) == [ 8, 0 ])
-    assert(compute_spectrum_by_definition(np.ones((2,2), dtype = np.uint8)) == [ 40, 24, 0, 0 ])
-    assert(compute_spectrum_by_definition(np.ones((3,2), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
-    assert(compute_spectrum_by_definition(np.ones((2,3), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
-    stretched_as = compute_spectrum_by_definition(np.array([
+    # definition
+    assert(compute_area_spectrum_by_definition(np.ones((0,0), dtype = np.uint8)) == [])
+    assert(compute_area_spectrum_by_definition(np.ones((1,1), dtype = np.uint8)) == [ 1 ])
+    assert(compute_area_spectrum_by_definition(np.ones((2,1), dtype = np.uint8)) == [ 8, 0 ])
+    assert(compute_area_spectrum_by_definition(np.ones((1,2), dtype = np.uint8)) == [ 8, 0 ])
+    assert(compute_area_spectrum_by_definition(np.ones((2,2), dtype = np.uint8)) == [ 40, 24, 0, 0 ])
+    assert(compute_area_spectrum_by_definition(np.ones((3,2), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
+    assert(compute_area_spectrum_by_definition(np.ones((2,3), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
+    stretched_as = compute_area_spectrum_by_definition(np.array([
         [      0,  32601,      0,     15,      0,      3,      0,       4,      0],
         [      5,      0,      6,      0,      7,      0,     17,       0,      9],
         [      0,     10,      0,     11,      0,     12,      0,      13,      0],
         [     14,      0,     15,      0,     16,      0,     19,       0,2**32+1] ], dtype=np.uint64))
-    unstretched_as = compute_spectrum_by_definition(np.array([
+    unstretched_as = compute_area_spectrum_by_definition(np.array([
         [      0,      5,  32601,      0,      0,      0],
         [     14,     10,      6,     15,      0,      0],
         [      0,     15,     11,      7,      3,      0],
@@ -45,10 +63,3 @@ if True:
         [      0,      0,      0,      0,2**32+1,      0]], dtype=np.uint64))
     assert(stretched_as[::2] == unstretched_as[:len(unstretched_as)//2])
     assert(stretched_as[1::2] == unstretched_as[len(unstretched_as)//2:] == [0]*(len(unstretched_as)//2))
- 
-# parallelisable ordered triplets of points ("by definition sped up")
-# tests
-# triple correlation
-# tests
-# parallelisable ordered pairs of diffs via NTT
-# tests
