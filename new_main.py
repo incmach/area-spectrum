@@ -24,42 +24,82 @@ def compute_area_spectrum_by_definition(I):
         result[double_volume(*s)] += math.prod(int(I[v]) for v in s)
     return result
 
-#triple correlation
-def compute_area_spectrum_via_triple_correlation(I):
-    rows, cols = I.shape
-    I_p = np.pad(I, tuple((n//2, n//2) for n in I.shape), constant_values = GF(0))
-    for d_12 in it.product(*(np.range(n) for n in I.shape)):
-        J = I*np.roll(I_p, d_12, (0, 1))
-        triple_spectrum_section = np.intt(np.ntt(J)*np.ntt(I_p))[rows:1-rows, cols:1-cols]
-        ys = np.arange(rows)
-        xs = np.arange(cols)
-        dy, dx = d_12
-        bins = dy*xs.reshape(1, -1) - dx*ys.reshape(-1, 1)
+def ntt2d(I, p):
+    GF = galois.GF(p)
+    per_row = GF([ galois.ntt(r, modulus = p) for r in I ])
+    return GF([ galois.ntt(col) for col in per_row.T ]).T
 
-        
+def intt2d(I, p):
+    GF = galois.GF(p)
+    per_col = GF([ galois.intt(col) for col in I.T ]).T
+    return GF([ galois.intt(row) for row in per_col ])[::-1]
+
+#triple correlation
+def compute_area_spectrum_via_ntt_triple_correlation(image):
+    if image.size == 0:
+        return [ ]
+    padding = [ n//2 for n in image.shape ] 
+    padded_I = np.pad(image, tuple((n, n) for n in padding), constant_values = 0)
+    p = image.size*(255**3)
+    p = galois.next_prime(p)
+    while (p-1)%padded_I.size != 0:
+        p = galois.next_prime(p+1)
+    GF = galois.GF(p)
+    result = np.zeros(image.size, dtype = int)
+    for d_12 in it.product(*(range(n) for n in image.shape)):
+        J = padded_I*np.roll(padded_I, d_12, (0, 1))
+        tc_section = intt2d(ntt2d(J, p)*ntt2d(padded_I, p), p)[tuple(slice(0,n) for p, n in zip(padding, image.shape))]*3
+        tc_section[0,0] //= 3
+
+            
+        ys, xs = [ np.arange(n) for n in image.shape ]
+        dy, dx = d_12
+        bin_idxs = abs(dy*xs.reshape(1, -1) - dx*ys.reshape(-1, 1))
+        # components of both d_12 and d_23 are non-negative. 
+        values = np.ravel(tc_section)
+        bins = np.ravel(bin_idxs)
+         
+        result += np.bincount(bins, weights = values, minlength = image.size).astype(int)
+        print()
+        print(f'{d_12}:')
+        print('padded_I')
+        print(padded_I)
+        print("J")
+        print(J)
+        print("tc_section")
+        print(tc_section)
+        print("bin_idxs")
+        print(bin_idxs)
+        print('result')
+        print(result)
+
+    return list(result)
 
 #TODO test_new_main.py
 
 if True:
-    # definition
-    assert(compute_area_spectrum_by_definition(np.ones((0,0), dtype = np.uint8)) == [])
-    assert(compute_area_spectrum_by_definition(np.ones((1,1), dtype = np.uint8)) == [ 1 ])
-    assert(compute_area_spectrum_by_definition(np.ones((2,1), dtype = np.uint8)) == [ 8, 0 ])
-    assert(compute_area_spectrum_by_definition(np.ones((1,2), dtype = np.uint8)) == [ 8, 0 ])
-    assert(compute_area_spectrum_by_definition(np.ones((2,2), dtype = np.uint8)) == [ 40, 24, 0, 0 ])
-    assert(compute_area_spectrum_by_definition(np.ones((3,2), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
-    assert(compute_area_spectrum_by_definition(np.ones((2,3), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
-    stretched_as = compute_area_spectrum_by_definition(np.array([
-        [      0,  32601,      0,     15,      0,      3,      0,       4,      0],
-        [      5,      0,      6,      0,      7,      0,     17,       0,      9],
-        [      0,     10,      0,     11,      0,     12,      0,      13,      0],
-        [     14,      0,     15,      0,     16,      0,     19,       0,2**32+1] ], dtype=np.uint64))
-    unstretched_as = compute_area_spectrum_by_definition(np.array([
-        [      0,      5,  32601,      0,      0,      0],
-        [     14,     10,      6,     15,      0,      0],
-        [      0,     15,     11,      7,      3,      0],
-        [      0,      0,     16,     12,     17,      4],
-        [      0,      0,      0,     19,     13,      9],
-        [      0,      0,      0,      0,2**32+1,      0]], dtype=np.uint64))
-    assert(stretched_as[::2] == unstretched_as[:len(unstretched_as)//2])
-    assert(stretched_as[1::2] == unstretched_as[len(unstretched_as)//2:] == [0]*(len(unstretched_as)//2))
+    for cas in compute_area_spectrum_via_ntt_triple_correlation, compute_area_spectrum_by_definition:
+        assert(cas(np.ones((0,0), dtype = np.uint8)) == [])
+        assert(cas(np.ones((1,1), dtype = np.uint8)) == [ 1 ])
+        v = cas(np.ones((2,1), dtype = np.uint8))
+        if v != [ 8, 0 ]:
+            print(v)
+            assert(False)
+        assert(cas(np.ones((1,2), dtype = np.uint8)) == [ 8, 0 ])
+        assert(cas(np.ones((2,2), dtype = np.uint8)) == [ 40, 24, 0, 0 ])
+        assert(cas(np.ones((3,2), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
+        assert(cas(np.ones((2,3), dtype = np.uint8)) == [ 108, 72, 36, 0, 0, 0 ])
+        stretched_as = cas(np.array([
+            [      0,  32601,      0,     15,      0,      3,      0,       4,      0],
+            [      5,      0,      6,      0,      7,      0,     17,       0,      9],
+            [      0,     10,      0,     11,      0,     12,      0,      13,      0],
+            [     14,      0,     15,      0,     16,      0,     19,       0,2**32+1] ], dtype=np.uint64))
+        unstretched_as = cas(np.array([
+            [      0,      5,  32601,      0,      0,      0],
+            [     14,     10,      6,     15,      0,      0],
+            [      0,     15,     11,      7,      3,      0],
+            [      0,      0,     16,     12,     17,      4],
+            [      0,      0,      0,     19,     13,      9],
+            [      0,      0,      0,      0,2**32+1,      0]], dtype=np.uint64))
+        assert(stretched_as[::2] == unstretched_as[:len(unstretched_as)//2])
+        assert(stretched_as[1::2] == unstretched_as[len(unstretched_as)//2:] == [0]*(len(unstretched_as)//2))
