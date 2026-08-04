@@ -24,22 +24,22 @@ def compute_area_spectrum_by_definition(I):
         result[double_volume(*s)] += math.prod(int(I[v]) for v in s)
     return result
 
-def ntt2d(I, p):
-    GF = galois.GF(p)
-    per_row = GF([ galois.ntt(r, modulus = p) for r in I ])
-    return GF([ galois.ntt(col) for col in per_row.T ]).T
+def ntt2d(arr, GF):
+    rows_ntt = GF([galois.ntt(GF(row)) for row in arr])
+    cols_ntt = GF([galois.ntt(GF(col)) for col in rows_ntt.T]).T
+    return cols_ntt
 
-def intt2d(I, p):
-    GF = galois.GF(p)
-    per_col = GF([ galois.intt(col) for col in I.T ]).T
-    return GF([ galois.intt(row) for row in per_col ])
+def intt2d(arr, GF):
+    cols_intt = GF([galois.intt(GF(col)) for col in arr.T])
+    rows_intt = GF([galois.intt(GF(row)) for row in cols_intt.T])
+    return rows_intt
 
 def compute_area_spectrum_via_ntt_triple_correlation(image):
     if image.size == 0:
         return [ ]
     padded_I = np.pad(image, tuple((0, n-1) for n in image.shape), constant_values = 0)
     rows, cols = image.shape
-    p = image.size*(255**3)
+    p = image.size*(np.iinfo(image.dtype).max**3)
     p = galois.next_prime(p)
     while (p-1)%padded_I.size != 0:
         p = galois.next_prime(p+1)
@@ -48,10 +48,7 @@ def compute_area_spectrum_via_ntt_triple_correlation(image):
     result = np.zeros(image.size, dtype = int)
     for d_12 in it.product(*(range(1-n, n) for n in image.shape)):
         J = padded_I*np.roll(padded_I, d_12, (0, 1))
-        print(np.sum(np.ravel(J*np.roll(padded_I, (0, 0), (0, 1)))))
-        tc_section = GF([
-            [ np.sum(np.ravel(J*np.roll(padded_I, (y, x), (0, 1)))) for x in it.chain(range(cols), range(1-cols,0)) ]
-            for y in it.chain(range(rows), range(1-rows,0))])
+        tc_section = np.roll(intt2d(ntt2d(J, GF)*ntt2d(padded_I, GF), GF), tuple(1-n for n in image.shape), (0,1))
 
         dys, dxs = [ np.roll(np.arange(1-n, n), 1-n) for n in image.shape ]
         dy, dx = d_12
@@ -60,21 +57,6 @@ def compute_area_spectrum_via_ntt_triple_correlation(image):
         bins = np.ravel(bin_idxs)
          
         result += np.bincount(bins, weights = values, minlength = image.size).astype(int)
-
-        print()
-        print(f'{d_12}:')
-        print('padded_I')
-        print(padded_I)
-        print("J")
-        print(J)
-        print("tc_section")
-        print(tc_section)
-        print("bin_idxs")
-        print(bin_idxs)
-        print("bins")
-        print(bins)
-        print('result')
-        print(result)
 
     return list(result)
 
