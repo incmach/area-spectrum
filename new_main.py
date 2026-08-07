@@ -4,6 +4,7 @@ import math
 import numpy as np
 import sympy
 import galois
+import concurrent.futures
 from typing import Any
 
 _volume_fs = dict()
@@ -37,7 +38,7 @@ def intt2d(arr: Any) -> Any:
     cols_intt = GF(np.apply_along_axis(galois.intt, -2, arr))
     return GF(np.apply_along_axis(galois.intt, -1, cols_intt))
 
-def compute_area_spectrum_via_ntt_triple_correlation(image, batch_size=64):
+def compute_area_spectrum_via_ntt_triple_correlation(image, batch_size=64, max_workers=None):
     if image.size == 0:
         return []
     
@@ -74,21 +75,12 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, batch_size=64):
     padded_I_rev = np.roll(np.flip(padded_I, axis=(0, 1)), (1, 1), axis=(0, 1))
     ntt_I_revs = [ntt2d(GF(padded_I_rev%p if p <= np.iinfo(image.dtype).max else padded_I_rev)) for GF,p in zip(GFs,primes)]
     
-    # Initialize the result array using object dtype for arbitrary precision
-    result = np.zeros(image.size, dtype=object)
-    
     # 3. Match NTT's standard un-shifted layout output mapping.
     dys = np.concatenate((np.arange(0, rows), np.arange(1-rows, 0)))
     dxs = np.concatenate((np.arange(0, cols), np.arange(1-cols, 0)))
     
-    # Initialize batch iterator
-    d_12_iterator = it.product(*(range(1-n, n) for n in image.shape))
-    
-    while True:
-        batch = list(it.islice(d_12_iterator, batch_size))
-        if not batch:
-            break
-            
+    def process_batch(batch):
+        """Worker function to process a batch of d_12 elements."""
         tc_section_primes = []
         
         # Calculate section of triple correlation in each GF(p) for the entire batch
@@ -119,11 +111,33 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, batch_size=64):
         bin_idxs = abs(dy * dxs.reshape(1, 1, -1) - dx * dys.reshape(1, -1, 1))
         
         bins = np.ravel(bin_idxs)
-        actual_bins = bins < len(result)
+        actual_bins = bins < image.size
         bins = bins[actual_bins]
         values = tc_section.ravel()[actual_bins]
-         
-        np.add.at(result, bins, values)
+        
+        # Create an isolated local result to ensure thread safety
+        local_result = np.zeros(image.size, dtype=object)
+        np.add.at(local_result, bins, values)
+        return local_result
+
+    # Initialize the global result array and the main iterator
+    result = np.zeros(image.size, dtype=object)
+    d_12_iterator = it.product(*(range(1-n, n) for n in image.shape))
+    
+    # Process batches concurrently using ThreadPoolExecutor
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        
+        while True:
+            # Batch slicing from previous logic[cite: 2]
+            batch = list(it.islice(d_12_iterator, batch_size))
+            if not batch:
+                break
+            futures.append(executor.submit(process_batch, batch))
+            
+        # Aggregate local results back into the main global array as they complete
+        for future in concurrent.futures.as_completed(futures):
+            result += future.result()
 
     return list(result)
 
