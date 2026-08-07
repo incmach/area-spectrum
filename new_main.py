@@ -26,18 +26,18 @@ def compute_area_spectrum_by_definition(I):
     return result
 
 def ntt2d(arr: Any) -> Any:
-    """Vectorized 2D NTT using numpy.apply_along_axis."""
+    """Vectorized 2D NTT using numpy.apply_along_axis over the last two axes."""
     GF = type(arr)
-    rows_ntt = GF(np.apply_along_axis(galois.ntt, 1, arr))
-    return GF(np.apply_along_axis(galois.ntt, 0, rows_ntt))
+    rows_ntt = GF(np.apply_along_axis(galois.ntt, -1, arr))
+    return GF(np.apply_along_axis(galois.ntt, -2, rows_ntt))
 
 def intt2d(arr: Any) -> Any:
-    """Vectorized 2D INTT using numpy.apply_along_axis."""
+    """Vectorized 2D INTT using numpy.apply_along_axis over the last two axes."""
     GF = type(arr)
-    cols_intt = GF(np.apply_along_axis(galois.intt, 0, arr))
-    return GF(np.apply_along_axis(galois.intt, 1, cols_intt))
+    cols_intt = GF(np.apply_along_axis(galois.intt, -2, arr))
+    return GF(np.apply_along_axis(galois.intt, -1, cols_intt))
 
-def compute_area_spectrum_via_ntt_triple_correlation(image):
+def compute_area_spectrum_via_ntt_triple_correlation(image, batch_size=64):
     if image.size == 0:
         return []
     
@@ -81,26 +81,42 @@ def compute_area_spectrum_via_ntt_triple_correlation(image):
     dys = np.concatenate((np.arange(0, rows), np.arange(1-rows, 0)))
     dxs = np.concatenate((np.arange(0, cols), np.arange(1-cols, 0)))
     
-    for d_12 in it.product(*(range(1-n, n) for n in image.shape)):
+    # Initialize batch iterator
+    d_12_iterator = it.product(*(range(1-n, n) for n in image.shape))
+    
+    while True:
+        batch = list(it.islice(d_12_iterator, batch_size))
+        if not batch:
+            break
+            
         tc_section_primes = []
         
-        # Calculate section of triple correlation in each GF(p)
+        # Calculate section of triple correlation in each GF(p) for the entire batch
         for i, p in enumerate(primes):
             GF = GFs[i]
             p_I = padded_Is[i]
             
-            J = p_I * GF(np.roll(p_I, d_12, (0, 1)))
+            # Stack rolled images to create a 3D batch array of shape (Batch, 2R-1, 2C-1)
+            rolled_batch = GF(np.stack([np.roll(p_I, d, (0, 1)) for d in batch]))
+            
+            # p_I broadcasts over the batched dimension
+            J = p_I * rolled_batch
+            
+            # ntt_I_revs[i] broadcasts over the batched dimension
             tc_section_p = intt2d(ntt2d(J) * ntt_I_revs[i])
             
             # Convert Galois array to standard Python ints wrapped in numpy object array
             tc_section_primes.append(np.array(tc_section_p.tolist(), dtype=object))
             
-        # Restore actual triple correlation via CRT
+        # Restore actual triple correlation via CRT across the entire batch
         tc_section = sum(tc_section_primes[i] * crt_coeffs[i] for i in range(len(primes))) % M
         
-        # Binning
-        dy, dx = d_12
-        bin_idxs = abs(dy * dxs.reshape(1, -1) - dx * dys.reshape(-1, 1))
+        # Batch Binning
+        dy = np.array([d[0] for d in batch])[:, None, None]
+        dx = np.array([d[1] for d in batch])[:, None, None]
+        
+        # Broadcast bin calculation to shape (Batch, 2R-1, 2C-1)
+        bin_idxs = abs(dy * dxs.reshape(1, 1, -1) - dx * dys.reshape(1, -1, 1))
         
         bins = np.ravel(bin_idxs)
         actual_bins = bins < len(result)
