@@ -4,6 +4,7 @@ import math
 import numpy as np
 import sympy
 import galois
+from typing import Any
 
 _volume_fs = dict()
 def double_volume(*vs):
@@ -24,15 +25,17 @@ def compute_area_spectrum_by_definition(I):
         result[double_volume(*s)] += math.prod(int(I[v]) for v in s)
     return result
 
-def ntt2d(arr, GF):
-    rows_ntt = GF([galois.ntt(GF(row)) for row in arr])
-    cols_ntt = GF([galois.ntt(GF(col)) for col in rows_ntt.T]).T
-    return cols_ntt
+def ntt2d(arr: Any) -> Any:
+    """Vectorized 2D NTT using numpy.apply_along_axis."""
+    GF = type(arr)
+    rows_ntt = GF(np.apply_along_axis(galois.ntt, 1, arr))
+    return GF(np.apply_along_axis(galois.ntt, 0, rows_ntt))
 
-def intt2d(arr, GF):
-    cols_intt = GF([galois.intt(GF(col)) for col in arr.T])
-    rows_intt = GF([galois.intt(GF(row)) for row in cols_intt.T])
-    return rows_intt
+def intt2d(arr: Any) -> Any:
+    """Vectorized 2D INTT using numpy.apply_along_axis."""
+    GF = type(arr)
+    cols_intt = GF(np.apply_along_axis(galois.intt, 0, arr))
+    return GF(np.apply_along_axis(galois.intt, 1, cols_intt))
 
 def compute_area_spectrum_via_ntt_triple_correlation(image):
     if image.size == 0:
@@ -43,18 +46,33 @@ def compute_area_spectrum_via_ntt_triple_correlation(image):
     rows, cols = image.shape
     
     # 1. P Calculation: Bound the max possible value by (sum of all pixels)^3
-    # Utilizing `dtype=object` ensures that we don't overflow the native python integers.
-    max_val = int(np.sum(image, dtype=object))**3
-    p = galois.next_prime(max_val)
-    while (p - 1) % padded_I.size != 0:
-        p = galois.next_prime(p + 1)
+    max_val = image.size*(np.iinfo(image.dtype).max**3)
+    
+    # Select multiple smallest fitting ps with a large enough product
+    primes = []
+    prod = 1
+    p = 2
+    while prod <= max_val:
+        p = galois.next_prime(p)
+        if (p - 1) % padded_I.size == 0:
+            primes.append(p)
+            prod *= p
+            
+    # Precompute CRT coefficients for vectorized restoration later
+    M = prod
+    crt_coeffs = []
+    for p in primes:
+        Mi = M // p
+        yi = pow(Mi, -1, p)
+        crt_coeffs.append(Mi * yi)
         
-    GF = galois.GF(p)
-    padded_I = GF(padded_I)
+    # Pre-instantiate fields and images to prevent redundant processing
+    GFs = [galois.GF(p) for p in primes]
+    padded_Is = [GF(padded_I%p if p <= np.iinfo(image.dtype).max else padded_I) for GF,p in zip(GFs,primes)]
     
     # 2. Cross-Correlation: cyclically reverse padded_I to establish I(-u)
     padded_I_rev = np.roll(np.flip(padded_I, axis=(0, 1)), (1, 1), axis=(0, 1))
-    ntt_I_rev = ntt2d(padded_I_rev, GF)
+    ntt_I_revs = [ntt2d(GF(padded_I_rev%p if p <= np.iinfo(image.dtype).max else padded_I_rev)) for GF,p in zip(GFs,primes)]
     
     # Initialize the result array using object dtype for arbitrary precision
     result = np.zeros(image.size, dtype=object)
@@ -64,26 +82,34 @@ def compute_area_spectrum_via_ntt_triple_correlation(image):
     dxs = np.concatenate((np.arange(0, cols), np.arange(1-cols, 0)))
     
     for d_12 in it.product(*(range(1-n, n) for n in image.shape)):
-        J = padded_I * np.roll(padded_I, d_12, (0, 1))
+        tc_section_primes = []
         
-        # Multiply by ntt_I_rev for cyclic cross-correlation instead of convolution
-        tc_section = intt2d(ntt2d(J, GF) * ntt_I_rev, GF)
+        # Calculate section of triple correlation in each GF(p)
+        for i, p in enumerate(primes):
+            GF = GFs[i]
+            p_I = padded_Is[i]
+            
+            J = p_I * GF(np.roll(p_I, d_12, (0, 1)))
+            tc_section_p = intt2d(ntt2d(J) * ntt_I_revs[i])
+            
+            # Convert Galois array to standard Python ints wrapped in numpy object array
+            tc_section_primes.append(np.array(tc_section_p.tolist(), dtype=object))
+            
+        # Restore actual triple correlation via CRT
+        tc_section = sum(tc_section_primes[i] * crt_coeffs[i] for i in range(len(primes))) % M
         
+        # Binning
         dy, dx = d_12
         bin_idxs = abs(dy * dxs.reshape(1, -1) - dx * dys.reshape(-1, 1))
         
-        # 4. Extract Galois elements precisely to Python ints to circumvent precision 
-        # losses encountered during np.bincount float64 implicit casts.
         bins = np.ravel(bin_idxs)
         actual_bins = bins < len(result)
         bins = bins[actual_bins]
-        values = np.array(tc_section.tolist(), dtype=object).ravel()[actual_bins]
+        values = tc_section.ravel()[actual_bins]
          
         np.add.at(result, bins, values)
 
     return list(result)
-
-#TODO test_new_main.py
 
 if True:
     for cas in [compute_area_spectrum_by_definition]:
