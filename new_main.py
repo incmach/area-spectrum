@@ -216,12 +216,13 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
     
     _g_image_size[0] = image.size
     
-    result = np.zeros(image.size, dtype=object)
+    result = np.zeros(image.size, dtype=np.int64)
     d_12_iterator = it.product(*(range(1-n, n) for n in image.shape))
            
     if max_workers is None or max_workers > 1:
         ctx = multiprocessing.get_context('fork')
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, #mp_context=ctx
+                                                   ) as executor:
             futures = []
             
             while True:
