@@ -70,7 +70,7 @@ _g_N_inv = []
 
 def process_batch(batch):
     """Worker function to process a batch of d_12 elements."""
-    tc_section_primes = []
+    tc_section_primes = np.zeros((len(_g_primes),len(batch),) + _g_padded_Is[0].shape, dtype = np.int64)
     
     # 1. Precalculate shifts and slicing indices for the entire batch ONCE
     H, W = _g_padded_Is[0].shape
@@ -105,11 +105,11 @@ def process_batch(batch):
         tc_section_p = (iW_R @ (ntt_J * _g_ntt_I_revs[i]) @ iW_C) * N_inv
         
         # Convert Galois array to standard Python ints wrapped in numpy object array
-        tc_section_primes.append(np.array(tc_section_p.tolist(), dtype=object))
+        tc_section_primes[i,:] = tc_section_p.astype(np.int64)
         
     # Restore actual triple correlation via CRT across the entire batch
     M = _g_M[0]
-    tc_section = sum(tc_section_primes[i] * _g_crt_coeffs[i] for i in range(len(_g_primes))) % M
+    tc_section = np.tensordot(_g_crt_coeffs, tc_section_primes, axes = 1) % M
     
     # Batch Binning
     dy = dys[:, None, None]
@@ -218,16 +218,8 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
     
     result = np.zeros(image.size, dtype=object)
     d_12_iterator = it.product(*(range(1-n, n) for n in image.shape))
-    
-    # Fast-path for small batches (prevents pool-spawn overhead for small images)
-    total_iterations = (2 * rows - 1) * (2 * cols - 1)
-    if total_iterations <= batch_size:
-        batch = list(d_12_iterator)
-        bins, values = process_batch(batch)
-        np.add.at(result, bins, values)
-        return list(result)
-        
-    if max_workers > 1:
+           
+    if max_workers is None or max_workers > 1:
         ctx = multiprocessing.get_context('fork')
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
             futures = []
@@ -289,7 +281,7 @@ if __name__ == '__main__':
     shape = (16,16)
     primes = get_ntt_primes(shape, np.uint8)
     image = np.random.randint(0,256,shape,dtype=np.uint8)
-    compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = 32, max_workers = 1)
+    compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = 16, max_workers = 1)
     total = 0
     
     print('...')
@@ -298,6 +290,6 @@ if __name__ == '__main__':
             print(i)
         image = np.random.randint(0,256,shape,dtype=np.uint8)
         start = time.perf_counter()
-        compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = 32, max_workers = 4)
+        compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = 16, max_workers = 1)
         total += time.perf_counter() - start
     print(total)
