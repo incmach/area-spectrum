@@ -7,6 +7,7 @@ import galois
 import concurrent.futures
 import multiprocessing
 from typing import Any
+import time
 
 _volume_fs = dict()
 def double_volume(*vs):
@@ -126,9 +127,9 @@ def process_batch(batch):
     values = tc_section.ravel()[actual_bins]
     
     # Return basic python lists to eliminate the heavy IPC object-pickling overhead
-    return bins.tolist(), values.tolist()
+    return bins, values
 
-def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8, max_workers=None):
+def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8):
     if image.size == 0 or not primes: #[cite: 1]
         return [] #[cite: 1]
     
@@ -183,11 +184,9 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
         p_I = GF(padded_I%p if p <= np.iinfo(image.dtype).max else padded_I) #[cite: 1]
         padded_Is.append(p_I) #[cite: 1]
         
-        # <--- NEW: Pre-tile and create sliding windows for O(1) rolling
         tiled_p_I = np.tile(p_I, (2, 2))
         windows = np.lib.stride_tricks.sliding_window_view(tiled_p_I, p_I.shape)
         windows_list.append(windows)
-        # --->
         
         p_I_rev = GF(padded_I_rev%p if p <= np.iinfo(image.dtype).max else padded_I_rev) #[cite: 1]
         ntt_I_rev = W_R @ p_I_rev @ W_C #[cite: 1]
@@ -218,29 +217,22 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
     
     result = np.zeros(image.size, dtype=np.int64)
     d_12_iterator = it.product(*(range(1-n, n) for n in image.shape))
-           
-    if max_workers is None or max_workers > 1:
-        ctx = multiprocessing.get_context('fork')
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, #mp_context=ctx
-                                                   ) as executor:
-            futures = []
-            
-            while True:
-                batch = list(it.islice(d_12_iterator, batch_size))
-                if not batch:
-                    break
-                futures.append(executor.submit(process_batch, batch))
-                
-            for future in concurrent.futures.as_completed(futures):
-                bins, values = future.result()
-                np.add.at(result, bins, values)
-    else:
-        while True:
-            batch = list(it.islice(d_12_iterator, batch_size))
-            if not batch:
-                break
-            bins, values = process_batch(batch)
-            np.add.at(result, bins, values)
+
+    counter = 0
+    total_batches = math.ceil(math.prod(2*(n-1) for n in image.shape)/batch_size)
+    start = time.perf_counter()
+    while True:
+        batch = list(it.islice(d_12_iterator, batch_size))
+        if not batch:
+            break
+
+
+        bins, values = process_batch(batch)
+        result += np.bincount(bins.ravel(), weights = values.ravel(), minlength = result.size).astype(np.int64)
+
+        counter += 1
+        if False and counter % 10 == 0:
+            print(f'{counter}/{total_batches} batches done: {time.perf_counter() - start}')
 
     return list(result)
 
@@ -278,19 +270,18 @@ if __name__ == '__main__':
                 primes = get_ntt_primes(image.shape, image.dtype)
                 assert(compute_area_spectrum_via_ntt_triple_correlation(image, primes) == compute_area_spectrum_by_definition(image))
     
-    import time
-    shape = (16,16)
+    shape = (25, 32)
+    batch_size = 256*512//(4*math.prod(shape))
     primes = get_ntt_primes(shape, np.uint8)
-    image = np.random.randint(0,256,shape,dtype=np.uint8)
-    compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = 16, max_workers = 1)
+    image = np.random.randint(0, 256, shape, dtype=np.uint8)
+    compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = batch_size)
     total = 0
     
     print('...')
-    for  i in range(1, 101):
-        if i % 10 == 0:
-            print(i)
+    for  i in range(1, 11):
+        print(i)
         image = np.random.randint(0,256,shape,dtype=np.uint8)
         start = time.perf_counter()
-        compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = 16, max_workers = 1)
+        compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = batch_size)
         total += time.perf_counter() - start
     print(total)
