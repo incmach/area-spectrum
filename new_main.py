@@ -38,7 +38,8 @@ def get_ntt_primes(shape, dtype):
         
     rows, cols = shape
     padded_size = (2 * rows - 1) * (2 * cols - 1)
-    max_val = math.prod(shape) * (np.iinfo(dtype).max ** 3)
+    
+    max_val = 6 * math.prod(shape) * (int(np.iinfo(dtype).max) ** 3)
     
     primes = []
     prod = 1
@@ -51,190 +52,177 @@ def get_ntt_primes(shape, dtype):
             
     return primes
 
-_g_primes = []
-_g_GFs = []
-_g_padded_Is = []
-_g_windows = []         # <--- NEW: Precomputed sliding windows
-_g_ntt_I_revs = []
-_g_crt_coeffs = []
-_g_M = [1]
-_g_dxs = []
-_g_dys = []
-_g_image_size = [0]
 
-# Global precomputed DFT matrices for O(1) batched transforms
-_g_W_R = []
-_g_W_C = []
-_g_iW_R = []
-_g_iW_C = []
-_g_N_inv = []
+@functools.lru_cache(maxsize=32)
+def _get_ntt_precomputations(shape, dtype_str, primes_tuple):
+    """
+    Caches field computations, DFT arrays, and inversion grids that are 
+    strictly dependent on the frame's structural dimensions.
+    """
+    rows, cols = shape
+    rows_pad, cols_pad = 2 * rows - 1, 2 * cols - 1
+    
+    M = math.prod(primes_tuple)
+    crt_coeffs = []
+    GFs = []
+    W_R_list, W_C_list = [], []
+    iW_R_list, iW_C_list = [], []
+    N_inv_list = []
+    
+    for p in primes_tuple:
+        Mi = M // p
+        yi = pow(Mi, -1, p)
+        crt_coeffs.append(Mi * yi)
+        
+        GF = galois.GF(p)
+        GFs.append(GF)
+        
+        alpha_R = GF.primitive_element ** ((GF.order - 1) // rows_pad)
+        pow_R = (np.arange(rows_pad)[:, None] * np.arange(rows_pad)[None, :]) % rows_pad
+        W_R = alpha_R ** pow_R
+        iW_R = (alpha_R ** -1) ** pow_R
+        
+        alpha_C = GF.primitive_element ** ((GF.order - 1) // cols_pad)
+        pow_C = (np.arange(cols_pad)[:, None] * np.arange(cols_pad)[None, :]) % cols_pad
+        W_C = alpha_C ** pow_C
+        iW_C = (alpha_C ** -1) ** pow_C
+        
+        W_R_list.append(W_R)
+        W_C_list.append(W_C)
+        iW_R_list.append(iW_R)
+        iW_C_list.append(iW_C)
+        
+        N_inv = GF(rows_pad * cols_pad) ** -1
+        N_inv_list.append(N_inv)
 
-def process_batch(batch):
-    """Worker function to process a batch of d_12 elements."""
-    tc_section_primes = np.zeros((len(_g_primes),len(batch),) + _g_padded_Is[0].shape, dtype = np.int64)
+    dys_13 = np.concatenate((np.arange(0, rows), np.arange(1-rows, 0)))
+    dxs_13 = np.concatenate((np.arange(0, cols), np.arange(1-cols, 0)))
     
-    # 1. Precalculate shifts and slicing indices for the entire batch ONCE
-    H, W = _g_padded_Is[0].shape
-    
-    dys = np.array([d[0] for d in batch])
-    dxs = np.array([d[1] for d in batch])
-    
-    # Map the shifts to their starting slice indices on a 2x2 tiled array
-    sys = H - (dys % H)
-    sxs = W - (dxs % W)
-    
-    # Calculate section of triple correlation in each GF(p) for the entire batch
-    for i, p in enumerate(_g_primes):
-        GF = _g_GFs[i]
-        p_I = _g_padded_Is[i]
-        
-        W_R, W_C = _g_W_R[i], _g_W_C[i]
-        iW_R, iW_C = _g_iW_R[i], _g_iW_C[i]
-        N_inv = _g_N_inv[i]
-        
-        # --- PRECOMPUTED ZERO-COPY BATCH SLICING ---
-        # Fetch exact memory views instantly via advanced indexing
-        rolled_batch = GF(_g_windows[i][sys, sxs])
-        
-        # p_I broadcasts over the batched dimension
-        J = p_I * rolled_batch
-        
-        # Purely vectorized batched 2D NTT via matrix multiplication
-        ntt_J = W_R @ J @ W_C
-        
-        # Purely vectorized batched 2D INTT via matrix multiplication
-        tc_section_p = (iW_R @ (ntt_J * _g_ntt_I_revs[i]) @ iW_C) * N_inv
-        
-        # Convert Galois array to standard Python ints wrapped in numpy object array
-        tc_section_primes[i,:] = tc_section_p.astype(np.int64)
-        
-    # Restore actual triple correlation via CRT across the entire batch
-    M = _g_M[0]
-    tc_section = np.tensordot(_g_crt_coeffs, tc_section_primes, axes = 1) % M
-    
-    # Batch Binning
-    dy = dys[:, None, None]
-    dx = dxs[:, None, None]
-    
-    # Broadcast bin calculation to shape (Batch, 2R-1, 2C-1)
-    bin_idxs = abs(dy * _g_dxs[0].reshape(1, 1, -1) - dx * _g_dys[0].reshape(1, -1, 1))
-    
-    bins = np.ravel(bin_idxs)
-    img_size = _g_image_size[0]
-    actual_bins = bins < img_size
-    
-    bins = bins[actual_bins]
-    values = tc_section.ravel()[actual_bins]
-    
-    # Return basic python lists to eliminate the heavy IPC object-pickling overhead
-    return bins, values
+    return (M, crt_coeffs, GFs, 
+            W_R_list, W_C_list, iW_R_list, iW_C_list, N_inv_list,
+            dys_13, dxs_13)
+
 
 def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8):
-    if image.size == 0 or not primes: #[cite: 1]
-        return [] #[cite: 1]
+    if image.size == 0 or not primes:
+        return []
     
-    # Pad the image to shape (2R-1, 2C-1)
-    padded_I = np.pad(image, tuple((0, n-1) for n in image.shape), constant_values=0) #[cite: 1]
-    rows, cols = image.shape #[cite: 1]
-    rows_pad, cols_pad = padded_I.shape #[cite: 1]
+    rows, cols = image.shape
     
-    M = math.prod(primes) #[cite: 1]
-    crt_coeffs = [] #[cite: 1]
+    # Extract cached invariants instantly via lru_cache
+    (M, crt_coeffs, GFs, 
+     W_R_list, W_C_list, iW_R_list, iW_C_list, N_inv_list,
+     dys_13, dxs_13) = _get_ntt_precomputations(image.shape, str(image.dtype), tuple(primes))
     
-    GFs = [] #[cite: 1]
-    padded_Is = [] #[cite: 1]
-    windows_list = []      # <--- NEW: Local tracker for windows
-    ntt_I_revs = [] #[cite: 1]
+    padded_I = np.pad(image, tuple((0, n-1) for n in image.shape), constant_values=0)
+    padded_I_rev = np.roll(np.flip(padded_I, axis=(0, 1)), (1, 1), axis=(0, 1))
     
-    W_R_list, W_C_list = [], [] #[cite: 1]
-    iW_R_list, iW_C_list = [], [] #[cite: 1]
-    N_inv_list = [] #[cite: 1]
+    padded_Is = []
+    windows_list = []
+    ntt_I_revs = []
+    max_val = np.iinfo(image.dtype).max
     
-    padded_I_rev = np.roll(np.flip(padded_I, axis=(0, 1)), (1, 1), axis=(0, 1)) #[cite: 1]
-    
-    # Precompute fields, matrices, and arrays
-    for p in primes: #[cite: 1]
-        Mi = M // p #[cite: 1]
-        yi = pow(Mi, -1, p) #[cite: 1]
-        crt_coeffs.append(Mi * yi) #[cite: 1]
+    # Iteration remains strictly for dynamic, frame-dependent projections
+    for i, p in enumerate(primes):
+        GF = GFs[i]
         
-        GF = galois.GF(p) #[cite: 1]
-        GFs.append(GF) #[cite: 1]
-        
-        # 1. Precompute batched DFT matrices for pure C-level vectorization
-        alpha_R = GF.primitive_element ** ((GF.order - 1) // rows_pad) #[cite: 1]
-        pow_R = (np.arange(rows_pad)[:, None] * np.arange(rows_pad)[None, :]) % rows_pad #[cite: 1]
-        W_R = alpha_R ** pow_R #[cite: 1]
-        iW_R = (alpha_R ** -1) ** pow_R #[cite: 1]
-        
-        alpha_C = GF.primitive_element ** ((GF.order - 1) // cols_pad) #[cite: 1]
-        pow_C = (np.arange(cols_pad)[:, None] * np.arange(cols_pad)[None, :]) % cols_pad #[cite: 1]
-        W_C = alpha_C ** pow_C #[cite: 1]
-        iW_C = (alpha_C ** -1) ** pow_C #[cite: 1]
-        
-        W_R_list.append(W_R) #[cite: 1]
-        W_C_list.append(W_C) #[cite: 1]
-        iW_R_list.append(iW_R) #[cite: 1]
-        iW_C_list.append(iW_C) #[cite: 1]
-        
-        N_inv = GF(rows_pad * cols_pad) ** -1 #[cite: 1]
-        N_inv_list.append(N_inv) #[cite: 1]
-        
-        # 2. Map images to field and pre-calculate NTT for reverse image
-        p_I = GF(padded_I%p if p <= np.iinfo(image.dtype).max else padded_I) #[cite: 1]
-        padded_Is.append(p_I) #[cite: 1]
+        p_I = GF(padded_I % p if p <= max_val else padded_I)
+        padded_Is.append(p_I)
         
         tiled_p_I = np.tile(p_I, (2, 2))
         windows = np.lib.stride_tricks.sliding_window_view(tiled_p_I, p_I.shape)
         windows_list.append(windows)
         
-        p_I_rev = GF(padded_I_rev%p if p <= np.iinfo(image.dtype).max else padded_I_rev) #[cite: 1]
-        ntt_I_rev = W_R @ p_I_rev @ W_C #[cite: 1]
-        ntt_I_revs.append(ntt_I_rev) #[cite: 1]
-    
-    # Update module-level globals so child processes inherit state efficiently via copy-on-write
-    _g_primes[:] = primes #[cite: 1]
-    _g_GFs[:] = GFs #[cite: 1]
-    _g_padded_Is[:] = padded_Is #[cite: 1]
-    _g_windows[:] = windows_list   # <--- NEW: Hoist window views to globals
-    _g_ntt_I_revs[:] = ntt_I_revs #[cite: 1]
-    _g_crt_coeffs[:] = crt_coeffs #[cite: 1]
-    _g_M[0] = M #[cite: 1]
+        p_I_rev = GF(padded_I_rev % p if p <= max_val else padded_I_rev)
+        ntt_I_rev = W_R_list[i] @ p_I_rev @ W_C_list[i]
+        ntt_I_revs.append(ntt_I_rev)
+
+    d13_y = dys_13.reshape(1, -1, 1)
+    d13_x = dxs_13.reshape(1, 1, -1)
+
+    def process_batch(batch):
+        tc_section_primes = np.zeros((len(primes), len(batch),) + padded_Is[0].shape, dtype=np.int64)
         
-    _g_W_R[:] = W_R_list
-    _g_W_C[:] = W_C_list
-    _g_iW_R[:] = iW_R_list
-    _g_iW_C[:] = iW_C_list
-    _g_N_inv[:] = N_inv_list
-    
-    _g_dys.clear()
-    _g_dys.append(np.concatenate((np.arange(0, rows), np.arange(1-rows, 0))))
-    
-    _g_dxs.clear()
-    _g_dxs.append(np.concatenate((np.arange(0, cols), np.arange(1-cols, 0))))
-    
-    _g_image_size[0] = image.size
-    
+        H, W = padded_Is[0].shape
+        
+        dys = np.array([d[0] for d in batch])
+        dxs = np.array([d[1] for d in batch])
+        
+        sys = H - (dys % H)
+        sxs = W - (dxs % W)
+        
+        for i, p in enumerate(primes):
+            GF = GFs[i]
+            p_I = padded_Is[i]
+            
+            W_R, W_C = W_R_list[i], W_C_list[i]
+            iW_R, iW_C = iW_R_list[i], iW_C_list[i]
+            N_inv = N_inv_list[i]
+            
+            rolled_batch = GF(windows_list[i][sys, sxs])
+            J = p_I * rolled_batch
+            
+            ntt_J = W_R @ J @ W_C
+            tc_section_p = (iW_R @ (ntt_J * ntt_I_revs[i]) @ iW_C) * N_inv
+            
+            tc_section_primes[i,:] = tc_section_p.astype(np.int64)
+            
+        tc_section = np.tensordot(crt_coeffs, tc_section_primes, axes=1) % M
+        
+        d12_y = dys[:, None, None]
+        d12_x = dxs[:, None, None]
+        
+        lex_greater = (d13_y > d12_y) | ((d13_y == d12_y) & (d13_x > d12_x))
+        lex_equal = (d13_y == d12_y) & (d13_x == d12_x)
+        lex_valid = lex_greater | lex_equal
+        
+        d12_is_zero = (d12_y == 0) & (d12_x == 0)
+        
+        weights_arr = np.full(tc_section.shape, 6, dtype=np.int64)
+        weights_arr = np.where(d12_is_zero, 3, weights_arr)
+        weights_arr = np.where(lex_equal, 3, weights_arr)
+        weights_arr = np.where(d12_is_zero & lex_equal, 1, weights_arr)
+        
+        bin_idxs = abs(d12_y * dxs_13.reshape(1, 1, -1) - d12_x * dys_13.reshape(1, -1, 1))
+        
+        actual_bins = bin_idxs < image.size
+        
+        valid_mask = lex_valid & actual_bins
+        
+        bins = bin_idxs[valid_mask]
+        values = (tc_section * weights_arr)[valid_mask]
+        
+        return bins, values
+
     result = np.zeros(image.size, dtype=np.int64)
-    d_12_iterator = it.product(*(range(1-n, n) for n in image.shape))
+    
+    def generate_d12():
+        for dy in range(1 - rows, rows):
+            for dx in range(1 - cols, cols):
+                if dy > 0 or (dy == 0 and dx >= 0):
+                    yield (dy, dx)
+
+    d_12_iterator = generate_d12()
+    
+    total_d12 = (math.prod(2*n - 1 for n in image.shape) + 1) // 2
+    total_batches = math.ceil(total_d12 / batch_size)
 
     counter = 0
-    total_batches = math.ceil(math.prod(2*(n-1) for n in image.shape)/batch_size)
     start = time.perf_counter()
     while True:
         batch = list(it.islice(d_12_iterator, batch_size))
         if not batch:
             break
 
-
         bins, values = process_batch(batch)
-        result += np.bincount(bins.ravel(), weights = values.ravel(), minlength = result.size).astype(np.int64)
+        result += np.bincount(bins, weights=values, minlength=result.size).astype(np.int64)
 
         counter += 1
         if False and counter % 10 == 0:
             print(f'{counter}/{total_batches} batches done: {time.perf_counter() - start}')
 
     return list(result)
+
 
 if __name__ == '__main__':
     if False:
@@ -270,18 +258,18 @@ if __name__ == '__main__':
                 primes = get_ntt_primes(image.shape, image.dtype)
                 assert(compute_area_spectrum_via_ntt_triple_correlation(image, primes) == compute_area_spectrum_by_definition(image))
     
-    shape = (25, 32)
-    batch_size = 256*512//(4*math.prod(shape))
+    shape = (32, 32)
+    batch_size = 64
     primes = get_ntt_primes(shape, np.uint8)
     image = np.random.randint(0, 256, shape, dtype=np.uint8)
     compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = batch_size)
     total = 0
     
     print('...')
-    for  i in range(1, 11):
+    for i in range(1, 11):
         print(i)
         image = np.random.randint(0,256,shape,dtype=np.uint8)
         start = time.perf_counter()
         compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = batch_size)
         total += time.perf_counter() - start
-    print(total)
+    print(f'Total computed in {total:.4f} seconds')
