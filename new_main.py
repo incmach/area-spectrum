@@ -4,9 +4,6 @@ import math
 import numpy as np
 import sympy
 import galois
-import concurrent.futures
-import multiprocessing
-from typing import Any
 import time
 
 _volume_fs = dict()
@@ -39,7 +36,7 @@ def get_ntt_primes(shape, dtype):
     rows, cols = shape
     padded_size = (2 * rows - 1) * (2 * cols - 1)
     
-    max_val = 6 * math.prod(shape) * (int(np.iinfo(dtype).max) ** 3)
+    max_val = math.prod(shape) * (int(np.iinfo(dtype).max) ** 3)
     
     primes = []
     prod = 1
@@ -52,28 +49,22 @@ def get_ntt_primes(shape, dtype):
             
     return primes
 
-
 @functools.lru_cache(maxsize=32)
 def _get_ntt_precomputations(shape, dtype_str, primes_tuple):
     """
     Caches field computations, DFT arrays, and inversion grids that are 
     strictly dependent on the frame's structural dimensions.
+    M and crt_coeffs have been removed to be computed dynamically per-batch.
     """
     rows, cols = shape
     rows_pad, cols_pad = 2 * rows - 1, 2 * cols - 1
     
-    M = math.prod(primes_tuple)
-    crt_coeffs = []
     GFs = []
     W_R_list, W_C_list = [], []
     iW_R_list, iW_C_list = [], []
     N_inv_list = []
     
     for p in primes_tuple:
-        Mi = M // p
-        yi = pow(Mi, -1, p)
-        crt_coeffs.append(Mi * yi)
-        
         GF = galois.GF(p)
         GFs.append(GF)
         
@@ -98,10 +89,7 @@ def _get_ntt_precomputations(shape, dtype_str, primes_tuple):
     dys_13 = np.concatenate((np.arange(0, rows), np.arange(1-rows, 0)))
     dxs_13 = np.concatenate((np.arange(0, cols), np.arange(1-cols, 0)))
     
-    return (M, crt_coeffs, GFs, 
-            W_R_list, W_C_list, iW_R_list, iW_C_list, N_inv_list,
-            dys_13, dxs_13)
-
+    return (GFs, W_R_list, W_C_list, iW_R_list, iW_C_list, N_inv_list, dys_13, dxs_13)
 
 def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8):
     if image.size == 0 or not primes:
@@ -110,8 +98,7 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
     rows, cols = image.shape
     
     # Extract cached invariants instantly via lru_cache
-    (M, crt_coeffs, GFs, 
-     W_R_list, W_C_list, iW_R_list, iW_C_list, N_inv_list,
+    (GFs, W_R_list, W_C_list, iW_R_list, iW_C_list, N_inv_list,
      dys_13, dxs_13) = _get_ntt_precomputations(image.shape, str(image.dtype), tuple(primes))
     
     padded_I = np.pad(image, tuple((0, n-1) for n in image.shape), constant_values=0)
@@ -120,20 +107,20 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
     padded_Is = []
     windows_list = []
     ntt_I_revs = []
-    max_val = np.iinfo(image.dtype).max
+    max_val_dtype = np.iinfo(image.dtype).max
     
-    # Iteration remains strictly for dynamic, frame-dependent projections
+    # Pre-generate sliding windows and reversed representations for dynamic prime selection
     for i, p in enumerate(primes):
         GF = GFs[i]
         
-        p_I = GF(padded_I % p if p <= max_val else padded_I)
+        p_I = GF(padded_I % p if p <= max_val_dtype else padded_I)
         padded_Is.append(p_I)
         
         tiled_p_I = np.tile(p_I, (2, 2))
         windows = np.lib.stride_tricks.sliding_window_view(tiled_p_I, p_I.shape)
         windows_list.append(windows)
         
-        p_I_rev = GF(padded_I_rev % p if p <= max_val else padded_I_rev)
+        p_I_rev = GF(padded_I_rev % p if p <= max_val_dtype else padded_I_rev)
         ntt_I_rev = W_R_list[i] @ p_I_rev @ W_C_list[i]
         ntt_I_revs.append(ntt_I_rev)
 
@@ -141,7 +128,32 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
     d13_x = dxs_13.reshape(1, 1, -1)
 
     def process_batch(batch):
-        tc_section_primes = np.zeros((len(primes), len(batch),) + padded_Is[0].shape, dtype=np.int64)
+        # 1. Recompute max_value for the first d_12 in the batch
+        dy0, dx0 = batch[0]
+        overlap_size = (rows - abs(dy0)) * (cols - abs(dx0))
+        batch_max_val = overlap_size * (int(np.iinfo(image.dtype).max) ** 3)
+        
+        # 2. Determine necessary number of primes for this batch
+        prod = 1
+        active_prime_count = 0
+        for p in primes:
+            active_prime_count += 1
+            prod *= p
+            if prod > batch_max_val:
+                break
+                
+        M = prod
+        
+        # 3. Compute crt_coeffs dynamically alongside main computation
+        batch_crt_coeffs = []
+        for i in range(active_prime_count):
+            p = primes[i]
+            Mi = M // p
+            yi = pow(Mi, -1, p)
+            batch_crt_coeffs.append(Mi * yi)
+            
+        # Allocate array strictly for the number of active primes
+        tc_section_primes = np.zeros((active_prime_count, len(batch),) + padded_Is[0].shape, dtype=np.int64)
         
         H, W = padded_Is[0].shape
         
@@ -151,7 +163,8 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
         sys = H - (dys % H)
         sxs = W - (dxs % W)
         
-        for i, p in enumerate(primes):
+        # Process ONLY the required primes for this specific batch
+        for i in range(active_prime_count):
             GF = GFs[i]
             p_I = padded_Is[i]
             
@@ -167,7 +180,7 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
             
             tc_section_primes[i,:] = tc_section_p.astype(np.int64)
             
-        tc_section = np.tensordot(crt_coeffs, tc_section_primes, axes=1) % M
+        tc_section = np.tensordot(batch_crt_coeffs, tc_section_primes, axes=1) % M
         
         d12_y = dys[:, None, None]
         d12_x = dxs[:, None, None]
@@ -197,10 +210,18 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
     result = np.zeros(image.size, dtype=np.int64)
     
     def generate_d12():
-        for dy in range(1 - rows, rows):
+        d_12_list = []
+        for dy in range(0, rows):
             for dx in range(1 - cols, cols):
                 if dy > 0 or (dy == 0 and dx >= 0):
-                    yield (dy, dx)
+                    overlap_size = (rows - abs(dy)) * (cols - abs(dx))
+                    d_12_list.append((-overlap_size, dy, dx))
+                    
+        # Sort such that the contributing part size is monotonously non-decreasing
+        d_12_list.sort(key=lambda x: x[0])
+        
+        for _, dy, dx in d_12_list:
+            yield (dy, dx)
 
     d_12_iterator = generate_d12()
     
@@ -222,7 +243,6 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
             print(f'{counter}/{total_batches} batches done: {time.perf_counter() - start}')
 
     return list(result)
-
 
 if __name__ == '__main__':
     if False:
@@ -258,18 +278,19 @@ if __name__ == '__main__':
                 primes = get_ntt_primes(image.shape, image.dtype)
                 assert(compute_area_spectrum_via_ntt_triple_correlation(image, primes) == compute_area_spectrum_by_definition(image))
     
-    shape = (32, 32)
-    batch_size = 64
-    primes = get_ntt_primes(shape, np.uint8)
-    image = np.random.randint(0, 256, shape, dtype=np.uint8)
-    compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = batch_size)
-    total = 0
-    
-    print('...')
-    for i in range(1, 11):
-        print(i)
-        image = np.random.randint(0,256,shape,dtype=np.uint8)
-        start = time.perf_counter()
+    if True:
+        shape = (32, 32)
+        batch_size = 128
+        primes = get_ntt_primes(shape, np.uint8)
+        image = np.random.randint(0, 256, shape, dtype=np.uint8)
         compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = batch_size)
-        total += time.perf_counter() - start
-    print(f'Total computed in {total:.4f} seconds')
+        total = 0
+        
+        print('...')
+        for i in range(1, 11):
+            print(i)
+            image = np.random.randint(0,256,shape,dtype=np.uint8)
+            start = time.perf_counter()
+            compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = batch_size)
+            total += time.perf_counter() - start
+        print(f'Total computed in {total:.4f} seconds')
