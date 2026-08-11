@@ -94,6 +94,7 @@ def _get_ntt_precomputations(shape, dtype_str, primes_tuple):
 def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8):
     if image.size == 0 or not primes:
         return []
+    primes = list(reversed(primes))
     
     rows, cols = image.shape
     
