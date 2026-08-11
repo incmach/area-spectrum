@@ -280,7 +280,7 @@ if __name__ == '__main__':
     
     if True:
         shape = (32, 32)
-        batch_size = 128
+        batch_size = 64
         primes = get_ntt_primes(shape, np.uint8)
         image = np.random.randint(0, 256, shape, dtype=np.uint8)
         compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size = batch_size)
