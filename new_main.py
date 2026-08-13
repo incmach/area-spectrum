@@ -1,5 +1,6 @@
 import functools
 import itertools as it
+from joblib import Parallel, delayed
 import math
 import numpy as np
 import sympy
@@ -229,19 +230,18 @@ def compute_area_spectrum_via_ntt_triple_correlation(image, primes, batch_size=8
     total_d12 = (math.prod(2*n - 1 for n in image.shape) + 1) // 2
     total_batches = math.ceil(total_d12 / batch_size)
 
-    counter = 0
-    start = time.perf_counter()
+    batches = []
     while True:
         batch = list(it.islice(d_12_iterator, batch_size))
         if not batch:
             break
+        batches.append(batch)
 
-        bins, values = process_batch(batch)
+    batch_results = Parallel(n_jobs=-1, return_as="generator_unordered")(
+            delayed(process_batch)(b) for b in batches)
+
+    for bins, values in batch_results:
         result += np.bincount(bins, weights=values, minlength=result.size).astype(np.int64)
-
-        counter += 1
-        if False and counter % 10 == 0:
-            print(f'{counter}/{total_batches} batches done: {time.perf_counter() - start}')
 
     return list(result)
 
