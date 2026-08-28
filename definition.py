@@ -1,4 +1,4 @@
-from functools import cache
+from functools import cache, lru_cache
 import itertools
 import math
 import numpy as np
@@ -19,3 +19,17 @@ def area_spectrum(I):
     for vs in itertools.product(itertools.product(*(range(n) for n in I.shape)), repeat = len(I.shape)+1):
         result[volume(vs)] += math.prod(int(I[v]) for v in vs)
     return result;
+
+def area_spectrum_int_gradient(I, target):
+    result = np.zeros_like(I).tolist()
+    current = area_spectrum(I)
+    directions = [ t - c for t, c in zip(target, current) ]
+    if len(directions) > 0:
+        directions[0] = 0
+    for v in itertools.product(*(range(n) for n in I.shape)):
+        assignment_target = result
+        for coordinate in v[:-1]:
+            assignment_target = assignment_target[coordinate]
+        for vs in itertools.product(itertools.product(*(range(n) for n in I.shape)), repeat = len(I.shape)):
+            assignment_target[v[-1]] += math.prod(int(I[v]) for v in vs)*directions[volume((v,) + vs)]
+    return result
