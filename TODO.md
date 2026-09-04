@@ -2,6 +2,8 @@
 
 ## Release 0.1 – Python Prototype
 
+**Description:** A working Python prototype that loads a small grayscale image, computes its area spectrum, visualizes it in a normalized way between two “basic” images, allows interactive editing of the spectrum, and reconstructs the image via steepest descent with integer steps.
+
 - [ ] **T0.1-01** Implement function to load a small grayscale image using OpenCV.
   - [ ] Write `load_image(path)` that reads an image file, converts to grayscale, returns a 2D NumPy array.
   - [ ] Add basic error handling (file not found, unsupported format).
@@ -61,7 +63,11 @@
   - [ ] Explain the area spectrum formula and the triple correlation method.
   - [ ] Provide usage instructions for the interactive prototype.
 
+---
+
 ## Release 0.2 – Algorithm Search with `egg` (Rust)
+
+**Description:** A Rust program that uses the `egg` e‑graph library to search for alternative, potentially more efficient algorithms for computing the area spectrum and its gradient, via rewrite rules over operations like NTT, section extraction, and binning.
 
 - [ ] **T0.2-01** Set up Rust project with `egg` and necessary dependencies.
   - [ ] Create a new cargo project.
@@ -103,7 +109,11 @@
   - [ ] Write a report summarizing the search, the top candidates, and their expected speedups.
   - [ ] Note which algorithm(s) will be used in Release 0.3.
 
+---
+
 ## Release 0.3 – Rust Implementation (Optimized for Medium Images)
+
+**Description:** A complete reimplementation of the interactive tool in Rust, using the algorithms from 0.1 or optimized versions from 0.2, with a GUI and performance suitable for medium‑sized images (up to 1024×1024).
 
 - [ ] **T0.3-01** Port area spectrum computation to Rust.
   - [ ] Implement the area spectrum using the chosen algorithm (baseline triple correlation or a candidate from 0.2).
@@ -149,7 +159,11 @@
   - [ ] Explain command‑line arguments or configuration.
   - [ ] Include troubleshooting tips.
 
+---
+
 ## Release 0.4 – GPU Acceleration
+
+**Description:** Adds GPU acceleration to the Rust application, using the portable `wgpu` backend (which also enables WebGPU for future browser use), to speed up compute‑intensive parts.
 
 - [ ] **T0.4-01** Evaluate GPU backends and select `wgpu`.
   - [ ] Research `wgpu`, CUDA, OpenCL in the context of this project.
@@ -185,7 +199,11 @@
   - [ ] Compare execution times and memory usage.
   - [ ] Write a short report in the README or docs.
 
+---
+
 ## Release 0.5 – Hardware Controller (Arduino)
+
+**Description:** Adds a physical Arduino‑based controller for editing the spectrum. Initially one slider selects a spectrum bin and one knob adjusts its value. The developer will learn basic electronics and experiment with the design.
 
 - [ ] **T0.5-01** Learn Arduino basics (analog input, serial communication) – self‑training task.
   - [ ] Complete tutorials on reading analog sensors (potentiometers) and sending serial data.
@@ -226,7 +244,11 @@
   - [ ] Include wiring diagram, parts list, and Arduino code.
   - [ ] Explain how to configure the serial port.
 
+---
+
 ## Release 0.6 – WebAssembly and Web Application
+
+**Description:** Compiles the core library to WebAssembly and creates a web application that replicates the interactive editing and reconstruction, making the tool accessible from a browser.
 
 - [ ] **T0.6-01** Refactor core algorithms into a library crate with no OS‑specific dependencies.
   - [ ] Create a new crate (e.g., `area_spectrum_core`) that contains spectrum computation, gradient, and optimization.
