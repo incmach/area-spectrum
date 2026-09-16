@@ -5,8 +5,16 @@ NTT-based (galois) computation of area_spectrum and of the exact integer
 squared row norms of the Jacobian of area_spectrum, using per-first-diff
 slices of the (d+1)-way correlation.
 
-The NTT prime is chosen from the dtype's maximum representable value and
-the image size.  No extra safety margin is applied.
+Two variants of area_spectrum_ntt:
+
+  * area_spectrum_ntt   -- a single prime large enough to hold the
+                           largest possible correlation value.
+  * area_spectrum_ntt_crt -- several small size-fitting primes whose
+                           product covers the same bound; the section
+                           values are recovered exactly via CRT.
+
+The NTT prime(s) are chosen from the dtype's maximum representable
+value and the image size.  No extra safety margin is applied.
 """
 
 import itertools
@@ -32,15 +40,21 @@ def _dtype_max(dtype):
     raise TypeError(f"Unsupported dtype for NTT: {dtype}")
 
 
+def _transform_lcm(transform_sizes):
+    """Least common multiple of the NTT transform sizes along each axis."""
+    L = 1
+    for s in transform_sizes:
+        L = L * s // math.gcd(L, s)
+    return L
+
+
 def find_ntt_prime(min_value, transform_sizes):
     """
     Return a prime p > min_value such that p - 1 is divisible by every
     element of transform_sizes (so primitive roots of unity of those
     orders exist mod p).
     """
-    L = 1
-    for s in transform_sizes:
-        L = L * s // math.gcd(L, s)
+    L = _transform_lcm(transform_sizes)
     target = max(2, int(min_value) + 1)
     rem = (target - 1) % L
     p = target + ((L - rem) % L)
@@ -70,6 +84,64 @@ def choose_ntt_prime(I):
     max_corr = 1 if V <= 0 else n_total * (V ** (d + 1))
     ntt_shape = tuple(1 << max(0, 2 * n - 2).bit_length() for n in I.shape)
     return find_ntt_prime(max_corr, list(ntt_shape)), ntt_shape
+
+
+def choose_ntt_crt_primes(I):
+    """
+    Choose a list of NTT primes whose product is large enough to hold
+    the largest possible (d+1)-way correlation value given I.dtype and
+    I.shape, with the same bound as choose_ntt_prime():
+    n_total * V**(d+1), V = max representable value of I.dtype.
+
+    The primes are the smallest distinct primes p congruent to 1 modulo
+    L = lcm of the per-axis NTT sizes, generated in increasing order
+    until the product strictly exceeds the bound.  The section values of
+    the (d+1)-way correlation are then each recovered exactly from their
+    residues via the Chinese remainder theorem, instead of relying on a
+    single prime that onitself has to be bigger than the whole bound.
+
+    Note: callers must not widen I (e.g. to int64) before calling this.
+    """
+    I = np.asarray(I)
+    d = I.ndim
+    n_total = I.size
+    V = _dtype_max(I.dtype)
+    max_corr = 1 if V <= 0 else n_total * (V ** (d + 1))
+    ntt_shape = tuple(1 << max(0, 2 * n - 2).bit_length() for n in I.shape)
+    L = _transform_lcm(ntt_shape)
+    primes = []
+    product = 1
+    q = L + 1 if L > 1 else 2
+    while product <= max_corr:
+        while not galois.is_prime(q):
+            q += L
+        primes.append(int(q))
+        product *= q
+        q += L
+    return primes, ntt_shape
+
+
+def crt_reconstruct(residues, moduli):
+    """
+    Reconstruct exact integers from residues modulo coprime moduli
+    (Garner's algorithm).
+
+    residues : sequence of equal-shape integer arrays, all reduced into
+               [0, moduli[i]).
+    moduli   : sequence of pairwise coprime positive ints.
+    Returns an int64 array with the unique value in [0, prod(moduli))
+    congruent to residues[i] mod moduli[i] for every i.
+    """
+    moduli = [int(m) for m in moduli]
+    x = np.asarray(residues[0], dtype=object).copy()
+    prod = int(moduli[0])
+    for r, m in zip(residues[1:], moduli[1:]):
+        r = np.asarray(r)
+        inv = pow(prod, -1, m)
+        t = ((r - (x % m)) % m) * inv % m
+        x = x + prod * t
+        prod = prod * m
+    return x.astype(np.int64)
 
 
 # ====================================================================
@@ -178,6 +250,31 @@ def _diff_product(I, xs, diffs):
 # area_spectrum via NTT
 # ====================================================================
 
+def _rev_rolled_J(I, xs, prefix, ntt_shape):
+    """J(x) = I[x] * prod_i I[x + prefix_i], zero-padded to ntt_shape and
+    reversed-and-rolled so that the NTT correlation reads as a
+    cross-correlation over lags."""
+    d = len(I.shape)
+    J_block = _shifted_product(I, xs, prefix)
+    J_pad = np.zeros(ntt_shape, dtype=np.int64)
+    J_pad[np.ix_(*xs)] = J_block
+    rev = tuple(slice(None, None, -1) for _ in range(d))
+    return np.roll(J_pad[rev], (1,) * d, axis=tuple(range(d)))
+
+
+def _corr_section(I_hat, J_rev, prime):
+    """Full correlation section INTT(NTT(J_rev) * I_hat), returned as
+    int64 residues in [0, prime).
+
+    The raw J values are reduced mod prime before entering the field;
+    the section value mod prime is unchanged by that reduction.
+    """
+    GF = galois.GF(prime)
+    J_rev_hat = _nd_ntt(GF(np.mod(J_rev, prime)))
+    T_hat = J_rev_hat * I_hat
+    return np.asarray(_nd_intt(T_hat), dtype=np.int64)
+
+
 def area_spectrum_ntt(I, prime=None):
     """
     NTT-based area spectrum.
@@ -220,19 +317,56 @@ def area_spectrum_ntt(I, prime=None):
         if xs is None:
             continue
 
-        # J(x) = I[x] * prod_i I[x + prefix_i] over valid origins.
-        J_block = _shifted_product(I, xs, prefix)
+        J_rev = _rev_rolled_J(I, xs, prefix, ntt_shape)
+        T_np = _corr_section(I_hat, J_rev, prime)
 
-        J_pad = np.zeros(ntt_shape, dtype=np.int64)
-        J_pad[np.ix_(*xs)] = J_block
+        for a_d in all_diffs:
+            idx = tuple(a % m for a, m in zip(a_d, ntt_shape))
+            val = int(T_np[idx])
+            if val == 0:
+                continue
+            k = volume(((0,) * d,) + tuple(prefix) + (a_d,))
+            if 0 <= k < n_total:
+                result[k] += val
 
-        # Reverse-and-roll to turn convolution into cross-correlation.
-        rev = tuple(slice(None, None, -1) for _ in range(d))
-        J_rev = np.roll(J_pad[rev], (1,) * d, axis=tuple(range(d)))
-        J_rev_hat = _nd_ntt(GF(J_rev))
+    return result
 
-        T_hat = J_rev_hat * I_hat
-        T_np = np.asarray(_nd_intt(T_hat), dtype=np.int64)
+
+def area_spectrum_ntt_crt(I):
+    """
+    NTT-based area spectrum using the Chinese remainder theorem.
+
+    Same computation as area_spectrum_ntt(), but instead of a single
+    prime larger than the whole correlation bound, several small primes
+    p_i (see choose_ntt_crt_primes) are used.  For each prefix the
+    correlation section is computed modulo each p_i (reusing the same
+    NTT machinery), the exact section is then recovered via CRT, and the
+    section is binned and aggregated exactly like the single-prime path.
+    """
+    primes, ntt_shape = choose_ntt_crt_primes(I)
+
+    I = np.asarray(I, dtype=np.int64)
+    shape = I.shape
+    d = len(shape)
+    n_total = I.size
+
+    I_pad = np.zeros(ntt_shape, dtype=np.int64)
+    I_pad[tuple(slice(0, n) for n in shape)] = I
+    I_hats = [_nd_ntt(galois.GF(p)(np.mod(I_pad, p))) for p in primes]
+
+    result = [0] * n_total
+    all_diffs = _all_diffs(shape)
+
+    for prefix in itertools.product(all_diffs, repeat=d - 1):
+        xs = _valid_grid(shape, prefix)
+        if xs is None:
+            continue
+
+        J_rev = _rev_rolled_J(I, xs, prefix, ntt_shape)
+        T_np = crt_reconstruct(
+            [_corr_section(hat, J_rev, p) for hat, p in zip(I_hats, primes)],
+            primes,
+        )
 
         for a_d in all_diffs:
             idx = tuple(a % m for a, m in zip(a_d, ntt_shape))

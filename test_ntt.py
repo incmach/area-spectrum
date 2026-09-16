@@ -2,9 +2,14 @@
 Tests for ntt.py, cross-checking the NTT-based implementation against
 the exact, non-optimized ones in definition.py.
 
-Covers find_ntt_prime() / choose_ntt_prime(), area_spectrum_ntt(),
+Covers find_ntt_prime() / choose_ntt_prime() / choose_ntt_crt_primes(),
+crt_reconstruct(), area_spectrum_ntt(), area_spectrum_ntt_crt(),
 area_spectrum_jacobian_row_squared_norms(), scaled_objective_ntt() and
 area_spectrum_scaled_gradient_ntt().
+
+The single-prime variants are checked against definition.py; the CRT
+variant (area_spectrum_ntt_crt) is checked against the already-tested
+single-prime area_spectrum_ntt.
 
 Runnable directly (python test_ntt.py) or via pytest.
 All images are small (<= 8x8); the 3D case is expensive (about 30s)
@@ -20,6 +25,7 @@ import definition
 import ntt
 
 AREA_SPECTRUM_NTT = ntt.area_spectrum_ntt
+AREA_SPECTRUM_NTT_CRT = ntt.area_spectrum_ntt_crt
 ROW_NORMS_NTT = ntt.area_spectrum_jacobian_row_squared_norms
 SCALED_OBJECTIVE_NTT = ntt.scaled_objective_ntt
 SCALED_GRADIENT_NTT = ntt.area_spectrum_scaled_gradient_ntt
@@ -66,6 +72,37 @@ def test_choose_ntt_prime_uses_original_dtype():
     assert p64 > 1e50
 
 
+def test_choose_ntt_crt_primes_properties():
+    for shape in [(2, 2), (3, 2), (3, 3)]:
+        I = np.ones(shape, dtype=np.uint8)
+        primes, ntt_shape = ntt.choose_ntt_crt_primes(I)
+        expected_shape = tuple(
+            1 << max(0, 2 * n - 2).bit_length() for n in shape
+        )
+        assert ntt_shape == expected_shape
+        bound = I.size * (255 ** (len(shape) + 1))
+        assert primes == sorted(set(primes))  # distinct, ascending
+        assert math.prod(primes) > bound  # product covers the bound
+        assert math.prod(primes[:-1]) <= bound  # smallest possible set
+        for p in primes:
+            assert p > 1
+            for s in ntt_shape:
+                assert (p - 1) % s == 0
+
+
+def test_crt_reconstruct_recovers_small_integers():
+    moduli = [5, 7, 11, 13]
+    for x in range(100):
+        residues = [np.array([x % m]) for m in moduli]
+        assert int(ntt.crt_reconstruct(residues, moduli)[0]) == x
+
+
+def test_crt_reconstruct_rejects_out_of_range():
+    # A value >= product of the moduli cannot be recovered uniquely.
+    residues = [np.array([1]), np.array([1])]
+    assert int(ntt.crt_reconstruct(residues, [2, 3])[0]) == 1
+
+
 # ---------------------------------------------------------------------------
 # area_spectrum_ntt()
 # ---------------------------------------------------------------------------
@@ -108,6 +145,20 @@ def test_area_spectrum_ntt_explicit_prime_matches_default():
     p, _ = ntt.choose_ntt_prime(I)
     assert AREA_SPECTRUM_NTT(I, prime=p) == AREA_SPECTRUM_NTT(I)
     assert AREA_SPECTRUM_NTT(I, prime=p) == AREA_SPECTRUM(I)
+
+
+def test_area_spectrum_ntt_crt_matches_single_prime():
+    rng = np.random.default_rng(10)
+    for shape in [(4,), (2, 2), (3, 2), (2, 3), (3, 3)]:
+        I = rng.integers(0, 5, size=shape).astype(np.uint8)
+        assert AREA_SPECTRUM_NTT_CRT(I) == AREA_SPECTRUM_NTT(I), shape
+
+
+def test_area_spectrum_ntt_crt_ones_known_values():
+    assert AREA_SPECTRUM_NTT_CRT(np.ones((2, 2), dtype=np.uint8)) == [40, 24, 0, 0]
+    assert AREA_SPECTRUM_NTT_CRT(np.ones((3, 3), dtype=np.uint8)) == [
+        273, 192, 192, 24, 48, 0, 0, 0, 0,
+    ]
 
 
 # ---------------------------------------------------------------------------
