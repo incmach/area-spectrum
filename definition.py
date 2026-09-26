@@ -4,6 +4,8 @@ import math
 
 import sympy
 
+MAX_DIMENSION = 4
+
 
 @cache
 def volume_function(d):
@@ -17,6 +19,31 @@ def volume(vs):
     return f(*vs)
 
 
+@cache
+def dimension_multiplier(d):
+    """Upper bound on the determinant of a d x d 0/1 matrix.
+
+    A parallelepiped whose vertices are grid points has
+        |det| <= prod(n_i - 1) * D_d
+    with D_d the largest determinant of a d x d 0/1 matrix. Hadamard's
+    inequality bounds it by (d+1)^((d+1)/2) / 2^d, which is exact at d=3 and
+    d=7 and loose in between. Since prod(n_i - 1) < I.size, a bin count of
+    I.size * D_d is always sufficient. Exact values for small d are 1, 1, 2.
+
+    Past MAX_DIMENSION the bound is no longer offered, since the spectrum would
+    be padded far beyond anything a real image needs.
+    """
+    if d > MAX_DIMENSION:
+        raise ValueError(f"dimension {d} exceeds supported maximum {MAX_DIMENSION}")
+    if d <= 2:
+        return 1
+    return math.ceil((d + 1) ** ((d + 1) / 2) / 2 ** d)
+
+
+def spectrum_length(I):
+    return I.size * dimension_multiplier(len(I.shape))
+
+
 def coordinates(I):
     return list(itertools.product(*(range(n) for n in I.shape)))
 
@@ -25,12 +52,10 @@ def area_spectrum(I):
     """Exact area spectrum: R[k] = sum over ordered (d+1)-tuples S of prod I[S]."""
     d = len(I.shape)
     coords = coordinates(I)
-    n_spectrum = I.size
+    n_spectrum = spectrum_length(I)
     result = [0] * n_spectrum
     for S in itertools.product(coords, repeat=d + 1):
         k = volume(S)
-        if k >= n_spectrum:
-            continue
         result[k] += math.prod(int(I[v]) for v in S)
     return result
 
@@ -44,12 +69,10 @@ def jacobian_row_sums(I):
     """
     d = len(I.shape)
     coords = coordinates(I)
-    n_spectrum = I.size
+    n_spectrum = spectrum_length(I)
     result = [0] * n_spectrum
     for S in itertools.product(coords, repeat=d + 1):
         k = volume(S)
-        if k >= n_spectrum:
-            continue
         vals = [int(I[v]) for v in S]
         m = len(vals)
         prefix = [1] * (m + 1)
