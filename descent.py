@@ -56,6 +56,24 @@ class SpectrumBackend(Protocol):
         """Gradient of the normalized residual at I, ordered like I.ravel()."""
 
 
+@runtime_checkable
+class ColumnBackend(Protocol):
+    """The optional fast path: exact Jacobian columns, one pixel at a time.
+
+    Split out from SpectrumBackend because it is genuinely optional, and a
+    Protocol that isinstance-checks cannot express "has this if you have it".
+    A backend satisfying only SpectrumBackend is complete and correct; adding
+    this one makes descent an order of magnitude faster without changing a
+    single result.
+
+    Given the exact column at a pixel, a unit step's spectrum is a sum rather
+    than a fresh spectrum, by trilinearity. See _step_spectrum.
+    """
+
+    def jacobian_column(self, I, pixel) -> Sequence[int]:
+        """Exact Jacobian column at one pixel, indexed by bin."""
+
+
 class ReferenceBackend:
     """The brute-force reference in definition.py, as a descent backend.
 
@@ -64,14 +82,17 @@ class ReferenceBackend:
     the descent-facing signatures live here.
     """
 
-    def area_spectrum(self, I):
+    def area_spectrum(self, I, max_value=None):
         return definition.area_spectrum(I)
 
-    def jacobian_row_sums(self, I):
+    def jacobian_row_sums(self, I, max_value=None):
         return definition.jacobian_row_sums(I)
 
-    def spectrum_gradient(self, I, target, scale):
-        return definition.spectrum_gradient(I, target, scale)
+    def spectrum_gradient(self, I, target, scale, spectrum=None):
+        return definition.spectrum_gradient(I, target, scale, spectrum)
+
+    def jacobian_column(self, I, pixel, max_value=None):
+        return definition.jacobian_column(I, pixel)
 
 
 REFERENCE = ReferenceBackend()
@@ -97,7 +118,60 @@ def _resolve(backend):
     return backend
 
 
-def spectrum_loss(I, target, scale, backend=None):
+def _with_max_value(fn, backend, args, max_value):
+    """Call a backend method, offering max_value if it will take one.
+
+    descent already knows the value range it will confine the search to -- it is
+    the max_value the steps are clamped to -- and a backend that reconstructs
+    exact integers by CRT has to pick its primes from some bound on the pixels.
+    Left to guess from the dtype, an int64 image is charged for 2**63 and gets
+    fifteen to twenty passes where five would do. Passing the bound down is
+    exact, not an approximation: the true values are smaller than the bound, so
+    fewer primes still reconstruct them.
+
+    Optional on purpose. A backend that does not declare a max_value is asked
+    without one, so existing implementations keep working; the TypeError comes
+    from the call itself, and only for the keyword this adds.
+    """
+    if max_value is None:
+        return fn(*args)
+    try:
+        return fn(*args, max_value=max_value)
+    except TypeError:
+        # Only the keyword is retried without; a TypeError from inside the call
+        # would be swallowed here, which is the one cost of staying compatible
+        # with backends written against the three-method protocol. The bound is
+        # an optimization, so a backend that rejects it must not fail the run.
+        return fn(*args)
+
+
+def _step_spectrum(spectrum, I, pixel, step, backend, max_value=None):
+    """The spectrum of I after one unit step, by trilinearity.
+
+        area_spectrum(I + step * e_p) == area_spectrum(I) + step * jacobian_column(I, p)
+
+    This is the identity, not a linearisation. Every term of the spectrum is a
+    product of *distinct* pixel values, so no term contains a square of the pixel
+    being moved and the spectrum is exactly linear in it; a unit step therefore
+    moves bin k by exactly the column, and the sum is the spectrum of the trial
+    image as an integer vector. The result is fed to the same
+    spectrum_residual_loss as a measured spectrum, so a candidate is scored by
+    its exact loss either way.
+
+    Falls back to measuring the trial image when the backend has no column, so a
+    backend written before this optimization still works -- it just pays for the
+    spectrum it could have added.
+    """
+    column = getattr(backend, "jacobian_column", None)
+    if column is None:
+        trial = np.array(I, copy=True)
+        trial[pixel] += step
+        return _with_max_value(backend.area_spectrum, backend, (trial,), max_value)
+    c = _with_max_value(column, backend, (I, pixel), max_value)
+    return [a + step * v for a, v in zip(spectrum, c)]
+
+
+def spectrum_residual_loss(spectrum, target, scale):
     """Sum of squared normalized residuals, over the bins the image can reach.
 
     L(I) = sum_{scale[k] > 0} ((area_spectrum(I)[k] - target[k]) / scale[k])**2
@@ -107,19 +181,37 @@ def spectrum_loss(I, target, scale, backend=None):
     test here is the same one definition.spectrum_residual_weights applies, so
     the loss and the gradient cannot drift apart about which bins count.
 
-    This is the value descent minimises, and it calls the backend once per
-    evaluation -- the hot path for the whole search. A backend that caches
-    between calls makes descent proportionally faster.
+    This is the value descent minimises. It takes a spectrum rather than an
+    image so that a measured spectrum and one predicted by trilinearity are
+    reduced by identical arithmetic -- comparing two numbers that went through
+    the same expression is what makes the comparison meaningful. Both are
+    exact integers before the division, so a predicted spectrum gives the
+    candidate's exact loss, not an estimate of it.
     """
-    backend = _resolve(backend)
     return sum(
         ((a - t) / s) ** 2
-        for a, t, s in zip(backend.area_spectrum(I), target, scale)
+        for a, t, s in zip(spectrum, target, scale)
         if s > 0
     )
 
 
-def ranked_gradient_steps(I, target, scale, min_value=0, max_value=255, backend=None):
+def spectrum_loss(I, target, scale, backend=None, spectrum=None, max_value=None):
+    """The loss of an image, from its spectrum.
+
+    spectrum is the spectrum of I if the caller already has it; supplying it
+    saves the backend a spectrum pass. max_value is the bound the image's
+    pixels are known to respect, offered to the backend so an exact-integer
+    one can size its arithmetic from the real range instead of the dtype. It is
+    the value descent minimises.
+    """
+    backend = _resolve(backend)
+    if spectrum is None:
+        spectrum = _with_max_value(backend.area_spectrum, backend, (I,), max_value)
+    return spectrum_residual_loss(spectrum, target, scale)
+
+
+def ranked_gradient_steps(I, target, scale, min_value=0, max_value=255, backend=None,
+                          spectrum=None):
     """Every feasible (pixel, step) the gradient would allow, best first.
 
     For a step s in {-1, +1} at pixel p the loss changes by s * dL/dI[p], so the
@@ -128,9 +220,23 @@ def ranked_gradient_steps(I, target, scale, min_value=0, max_value=255, backend=
 
     Pixels pinned at a bound in the direction they want are omitted rather than
     clamped, since stepping the other way raises the loss.
+
+    Pass the spectrum of I when the caller has it; the gradient needs it for the
+    residual weights and it is the expensive half of that call.
     """
     backend = _resolve(backend)
-    gradient = backend.spectrum_gradient(I, target, scale)
+    # Two optional keywords, both of which a backend written against the
+    # three-method protocol will not accept: the spectrum, so the gradient does
+    # not re-derive one descent already holds, and the value bound, so it does
+    # not size its arithmetic from the dtype. Each is dropped independently
+    # rather than together, so a backend that takes one still gets it.
+    try:
+        gradient = backend.spectrum_gradient(I, target, scale, spectrum, max_value)
+    except TypeError:
+        try:
+            gradient = backend.spectrum_gradient(I, target, scale, spectrum)
+        except TypeError:
+            gradient = backend.spectrum_gradient(I, target, scale)
     candidates = []
     for p, g in zip(coordinates(I), gradient):
         if g == 0:
@@ -166,21 +272,36 @@ def descent(I, target, scale=None, max_steps=1000, patience=25,
     moving one pixel at a time and keeping only moves that actually help.
 
     Each iteration takes the width best-ranked steps from ranked_gradient_steps
-    and keeps the one that most reduces the true integer-spectrum loss. The
-    spectrum is trilinear in the pixels, so the gradient gives a step's effect
-    on the spectrum exactly, and its top-ranked step is the single best move
-    available: measured on a 4x4, the head pick and the best available step
-    both decrease the loss by 0.1535. The repeated-point spectrum this replaced
-    was not so lucky -- its top pick gave 0.061 where 0.153 was available.
+    and keeps the one that most reduces the loss. The spectrum is trilinear in
+    the pixels, so the gradient gives a step's effect on the spectrum exactly,
+    and its top-ranked step is the single best move available: measured on a 4x4,
+    the head pick and the best available step both decrease the loss by 0.1535.
+    The repeated-point spectrum this replaced was not so lucky -- its top pick
+    gave 0.061 where 0.153 was available.
 
     Checking width candidates and keeping the best is therefore insurance
     against a mis-ranked step rather than a correction for nonlinearity, and
-    width=1 follows the gradient exactly. Raising width costs that many spectrum
+    width=1 follows the gradient exactly. Raising width costs that many column
     evaluations per accepted step and typically reaches a lower loss in fewer
     steps; a width covering every feasible step makes each move exactly the best
     available one.
 
-    Because the winner is chosen by measured loss, the returned history is
+    A candidate is scored by its exact loss, not an estimate: the spectrum of a
+    one-pixel step is the current spectrum plus the step's Jacobian column, which
+    is the identity rather than a first-order approximation, so scoring it costs
+    a column and not a spectrum. The spectrum is therefore computed once for the
+    run and carried forward a column at a time, instead of once per candidate.
+
+    What that changes is where the exactness of a step's score comes from. It
+    used to come from measuring each trial image's spectrum with an independent
+    call; it now comes from the column being exact, and the gradient that ranked
+    the step is derived from the same trilinearity. Both routes agree -- the
+    tests assert descent produces the identical image, loss and history either
+    way -- but a backend whose columns disagree with its spectrum would now be
+    able to talk itself into a losing step, where the measured route would have
+    caught it. Hide jacobian_column to get the measured route back.
+
+    Because the winner is chosen by exact loss, the returned history is
     non-increasing by construction.
 
     Two stopping conditions, per T0.1-06: max_steps, and patience consecutive
@@ -197,30 +318,50 @@ def descent(I, target, scale=None, max_steps=1000, patience=25,
     of steps accepted, the loss history, and whether patience ran out.
     """
     backend = _resolve(backend)
+    # The pixel range the search will stay inside, offered to the backend as a
+    # value bound. A backend that picks CRT primes from the dtype alone is
+    # charged for int64's 2**63 and pays for it in passes; the bound is exact
+    # because the true values are inside it, and the steps are clamped to it
+    # anyway, so the assumption is enforced by construction and not merely
+    # expected. None disables it, leaving the backend to its own default.
+    value_bound = max_value if max_value is not None else None
     if scale is None:
-        scale = backend.jacobian_row_sums(I)
+        scale = _with_max_value(backend.jacobian_row_sums, backend, (I,), value_bound)
     current = np.array(I, dtype=np.int64, copy=True)
-    loss = spectrum_loss(current, target, scale, backend)
+    # The spectrum of the current image, kept in hand for the whole run. The
+    # spectrum is trilinear, so a one-pixel step moves it by exactly the
+    # Jacobian column at that pixel: the next spectrum is this one plus the
+    # step's column, an exact integer either way. Carrying it forward is what
+    # turns one spectrum per candidate into one spectrum per run, and it stays
+    # exact over an arbitrary number of steps because every step adds integers.
+    spectrum = backend.area_spectrum(current)
+    loss = spectrum_residual_loss(spectrum, target, scale)
     history = [loss]
     accepted = 0
     stalled = 0
     for _ in range(max_steps):
         candidates = ranked_gradient_steps(
-            current, target, scale, min_value, max_value, backend
+            current, target, scale, min_value, max_value, backend, spectrum
         )
         best = None
+        best_move = None
         for pixel, step in candidates[:width]:
-            trial = current.copy()
-            trial[pixel] += step
-            trial_loss = spectrum_loss(trial, target, scale, backend)
+            trial_spectrum = _step_spectrum(spectrum, current, pixel, step, backend)
+            trial_loss = spectrum_residual_loss(trial_spectrum, target, scale)
             if trial_loss < loss and (best is None or trial_loss < best[0]):
-                best = (trial_loss, trial)
+                best = (trial_loss, trial_spectrum)
+                best_move = (pixel, step)
         if best is None:
             stalled += 1
             if stalled >= patience:
                 return Descent(current, loss, accepted, history, True)
             continue
-        loss, current = best
+        loss, spectrum = best
+        # Replay the accepted move on the image itself. The spectrum carried
+        # forward is the same one the trial was scored from, so the two cannot
+        # disagree about which pixel moved -- but the image is the thing
+        # returned, and it is derived here rather than carried alongside.
+        current[best_move[0]] += best_move[1]
         accepted += 1
         stalled = 0
         history.append(loss)

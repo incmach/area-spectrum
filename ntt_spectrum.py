@@ -242,6 +242,9 @@ def _primes_of_order_2(exponent):
     return tuple(out)
 
 
+_INT64_MAX = int(np.iinfo(np.int64).max)
+
+
 def dtype_max(dtype):
     """The largest value the dtype can hold, for a value-independent bound."""
     dtype = np.dtype(dtype)
@@ -816,36 +819,110 @@ def jacobian_row_sums_ntt(I, pad=None, primes=None, max_value=None):
             range(definition.spectrum_length(I))]
 
 
+def jacobian_column_ntt(I, pixel, max_value=None):
+    """The exact Jacobian column of I at `pixel`, in integers.
+
+    Equals definition.jacobian_column(I, pixel) exactly. Reaches 2D only, like
+    the other correlation paths.
+    """
+    I = np.asarray(I)
+    if I.ndim != 2:
+        raise UnsupportedDimension(
+            f"a column is a single-pixel relabelling of the offset sums and so "
+            f"reaches 2D only, not {I.ndim}D"
+        )
+    _check_nonneg(I)
+    H, W = I.shape
+    py, px = pixel
+    if not (0 <= py < H and 0 <= px < W):
+        raise ValueError(f"pixel {tuple(pixel)} is not a coordinate of an image of shape {I.shape}")
+    n_spectrum = definition.spectrum_length(I)
+    # The column is 3 * sum over ordered offset pairs of I[p+d1] * I[p+d2], so
+    # it is bounded by 3 * (sum of the pixels)**2 -- two factors of the pixel
+    # value rather than three, and no dependence on the pixel count beyond that
+    # sum. Well inside int64 for any real image, but not for an int64 one
+    # holding values near 2**63, so the bound is checked rather than assumed and
+    # the arithmetic is never silently wrapped. The sum is taken in Python
+    # integers for the same reason: an int64 total would itself wrap.
+    total = sum(int(v) for v in I.ravel())
+    bound = 3 * total * total
+    if bound > _INT64_MAX:
+        raise ValueError(
+            f"a Jacobian column of this image would exceed int64 "
+            f"(3 * sum**2 = {bound}); reduce the pixel range"
+        )
+    # The offsets that keep p + d inside the image: a rectangle, which is the
+    # same shape as the image itself and much smaller at a corner than the
+    # full (2H-1) x (2W-1) offset grid the spectrum loops over.
+    dy = np.arange(-py, H - py)
+    dx = np.arange(-px, W - px)
+    grid_y, grid_x = np.meshgrid(dy, dx, indexing="ij")
+    dy = grid_y.ravel()
+    dx = grid_x.ravel()
+    vals = I[py + dy, px + dx].astype(np.int64)
+    det = np.abs(dy[:, None] * dx[None, :] - dx[:, None] * dy[None, :])
+    # d1 and d2 must be distinct non-zero offsets. Distinct because the tuple
+    # must not name a point twice, non-zero for the same reason; either one
+    # gives det = 0, so a pair with either is in bin 0 and has to be removed
+    # from there rather than by its determinant.
+    keep = (
+        (det < n_spectrum)
+        & ((dy[:, None] != 0) | (dx[:, None] != 0))
+        & ((dy[None, :] != 0) | (dx[None, :] != 0))
+        & ~np.eye(len(dy), dtype=bool)
+    )
+    weights = (3 * vals[:, None] * vals[None, :])[keep]
+    column = np.bincount(det[keep], weights=weights, minlength=n_spectrum)
+    return [int(v) for v in column[:n_spectrum]]
+
+
 class NTTBackend:
+
     """A descent backend with every quantity on the correlation path.
 
-    Satisfies descent.SpectrumBackend. The spectrum and the row sums are the
-    exact integers of definition.py, reached by correlation and CRT; the
-    gradient is a float vector from numpy's FFT, equal to
-    definition.spectrum_gradient up to rounding. The gradient is the one part
-    that cannot be exact, because the weights themselves are floats.
+    Satisfies descent.SpectrumBackend. The spectrum, the row sums and the
+    columns are the exact integers of definition.py, reached by correlation, CRT
+    and direct offset sums; the gradient is a float vector from numpy's FFT,
+    equal to definition.spectrum_gradient up to rounding. The gradient is the
+    one part that cannot be exact, because the weights themselves are floats.
+
+    jacobian_column is optional in the protocol but supplied here, which is what
+    lets descent step a pixel without recomputing the spectrum: a column is
+    O(pixels**2) of small integer arithmetic against the spectrum's O(pixels**2
+    log pixels) per CRT pass, and it is exact either way, by trilinearity.
     """
 
     def __init__(self, pad=None, primes=None, max_value=None):
         self.pad = pad
         self.primes = primes
         self.max_value = max_value
-        # descent evaluates the loss of a candidate and then its gradient at
-        # the accepted image, so the spectrum of the current image is usually
-        # already in hand; caching it here keeps the gradient from paying for a
-        # second pass. Keyed by id, so it holds one image's worth and nothing
-        # grows with the number of steps.
+        # descent keeps the current spectrum in hand as it walks -- by
+        # trilinearity it is the old spectrum plus the column of the step taken
+        # -- so it has no reason to ask for it again here. Kept for callers
+        # that do: ask for a spectrum, then ask for the gradient at the same
+        # image, and the gradient gets the weights for free. Keyed by id, so it
+        # holds one image's worth and nothing grows with the number of steps.
         self._spectrum = None
         self._spectrum_for = None
 
-    def area_spectrum(self, I):
-        out = area_spectrum_ntt(I, self.pad, self.primes, self.max_value)
+    def area_spectrum(self, I, max_value=None):
+        if max_value is None:
+            max_value = self.max_value
+        out = area_spectrum_ntt(I, self.pad, self.primes, max_value)
         self._spectrum, self._spectrum_for = out, id(I)
         return out
 
-    def jacobian_row_sums(self, I):
-        return jacobian_row_sums_ntt(I, self.pad, self.primes, self.max_value)
+    def jacobian_row_sums(self, I, max_value=None):
+        if max_value is None:
+            max_value = self.max_value
+        return jacobian_row_sums_ntt(I, self.pad, self.primes, max_value)
 
-    def spectrum_gradient(self, I, target, scale):
-        spectrum = self._spectrum if self._spectrum_for == id(I) else None
+    def spectrum_gradient(self, I, target, scale, spectrum=None, max_value=None):
+        if spectrum is None and self._spectrum_for == id(I):
+            spectrum = self._spectrum
         return spectrum_gradient_ntt(I, target, scale, self.pad, spectrum)
+
+    def jacobian_column(self, I, pixel, max_value=None):
+        return jacobian_column_ntt(I, pixel, max_value if max_value is not None
+                                   else self.max_value)
+

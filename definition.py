@@ -164,6 +164,45 @@ def jacobian_row_sums(I):
     return result
 
 
+def jacobian_column(I, pixel):
+    """Exact Jacobian column C[k] = d area_spectrum(I)[k] / d I[pixel], for one pixel.
+
+    The third orientation of the Jacobian, after jacobian_transpose (indexed by
+    pixel) and jacobian_row_sums (indexed by bin, all pixels at once): this one is
+    indexed by bin but selects a single pixel, so it is the transpose of one row
+    of the Jacobian and the same length as a spectrum.
+
+    A tuple of d+1 distinct points contributes the product of the d values it
+    omits when it names `pixel`, once per position at which it carries that
+    pixel, which is the same prefix/suffix product jacobian_transpose uses.
+    Because the points are distinct, no term squares a value and the derivative
+    is exact rather than first-order.
+
+    What buys this is trilinearity. Every term is a product of distinct pixel
+    values, so the spectrum is linear in any one pixel and
+
+        area_spectrum(I + step * e_p)[k] == area_spectrum(I)[k] + step * C[k]
+
+    holds exactly for an integer step, in both directions. A search that needs
+    the spectrum of a one-pixel edit can therefore add this column instead of
+    recomputing the spectrum, and the resulting value is not an approximation of
+    the spectrum but the spectrum.
+
+    `pixel` is a coordinate tuple, and is required to be one of them.
+    """
+    d = len(I.shape)
+    coords = coordinates(I)
+    if pixel not in coords:
+        raise ValueError(f"pixel {pixel} is not a coordinate of an image of shape {I.shape}")
+    n_spectrum = spectrum_length(I)
+    result = [0] * n_spectrum
+    for S in itertools.permutations(coords, d + 1):
+        if pixel not in S:
+            continue
+        result[volume(S)] += math.prod(int(I[v]) for v in S if v != pixel)
+    return result
+
+
 def normalized_spectrum_gradient(I, delta):
     """Steepest-descent gradient of a normalized-spectrum target.
 
@@ -235,7 +274,7 @@ def spectrum_residual_weights(spectrum, target, scale):
     ]
 
 
-def spectrum_gradient(I, target, scale):
+def spectrum_gradient(I, target, scale, spectrum=None):
     """Gradient of the normalized-residual loss, as a flat list like I.ravel().
 
     The bin weights are the derivative of the squared normalized residual, so
@@ -248,10 +287,19 @@ def spectrum_gradient(I, target, scale):
     This is an exact quantity, not a first-order one. area_spectrum sums over
     tuples of distinct points, so no term names a pixel twice and the spectrum
     is multilinear; it is therefore linear in each pixel separately, and the
-    change a unit step at p makes to bin k is exactly J[k][p]. Ranking by this
-    gradient orders steps by their true effect on the residual, though the loss
-    is quadratic in the spectrum, so the best step by loss is not always the
-    best by gradient. Confirm a step against the loss before committing to it.
+    change a unit step at p makes to bin k is exactly J[k][p], which
+    jacobian_column returns. Ranking by this gradient orders steps by their true
+    effect on the residual, though the loss is quadratic in the spectrum, so the
+    best step by loss is not always the best by gradient. Confirm a step against
+    the loss before committing to it.
+
+    Pass `spectrum` to supply a spectrum of I that the caller already has -- by
+    trilinearity, or as the sum of the columns of the steps taken so far. The
+    weights need it and it is the expensive half of this call, so a caller that
+    has it should not pay for it twice. It must be the spectrum of this I;
+    passing anything else returns a gradient of the wrong loss.
     """
-    w = spectrum_residual_weights(area_spectrum(I), target, scale)
+    if spectrum is None:
+        spectrum = area_spectrum(I)
+    w = spectrum_residual_weights(spectrum, target, scale)
     return jacobian_transpose(I, w)
