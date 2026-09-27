@@ -9,6 +9,7 @@ shape with plausible values, or a spectrum that is right everywhere except the
 degenerate cases, so only a comparison against the reference catches them.
 """
 import math
+from collections import Counter
 
 import numpy as np
 import pytest
@@ -20,6 +21,7 @@ from definition import area_spectrum, spectrum_length
 from ntt_spectrum import (
     NTTBackend,
     UnsupportedDimension,
+    _masked_copy,
     _offsets,
     _primes_of_order_2,
     area_spectrum_ntt,
@@ -28,14 +30,19 @@ from ntt_spectrum import (
     dtype_max,
     embed,
     intt,
+    jacobian_row_sums_ntt,
     ntt,
     pad_length,
     pad_length_of_shape,
     pad_shape,
     primes_for,
+    primes_for_row_sums,
     primes_for_shape,
     primitive_root,
     root_table,
+    row_sum_bound,
+    row_sums_mod,
+    spectrum_gradient_ntt,
     spectrum_mod,
     triple_correlation,
 )
@@ -636,3 +643,435 @@ def test_descent_runs_against_the_ntt_backend():
     slow = descent.descent(I, target, scale, max_steps=40, patience=8, width=8)
     assert math.isclose(fast.loss, slow.loss, rel_tol=1e-9)
     assert np.array_equal(fast.image, slow.image)
+
+
+# ---------------------------------------------------------------------------
+# the row sums
+# ---------------------------------------------------------------------------
+
+def test_masked_copy_keeps_exactly_the_anchors_whose_partner_stays_inside():
+    """The kernel behind the row sums: a window on the anchors, not a shift."""
+    rng = np.random.default_rng(18)
+    I = rng.integers(1, 9, size=(3, 4)).astype(np.int64)
+    H, W = I.shape
+    pad = pad_shape(I)
+    for dy in range(-(H - 1), H):
+        for dx in range(-(W - 1), W):
+            got = _masked_copy(I, pad, dy, dx).reshape(pad)
+            want = np.zeros(pad, dtype=np.int64)
+            for y in range(H):
+                for x in range(W):
+                    y2, x2 = y + dy, x + dx
+                    if 0 <= y2 < H and 0 <= x2 < W:
+                        want[y, x] = I[y2, x2]
+            assert np.array_equal(got, want), f"offset {(dy, dx)}"
+
+
+def test_masked_copy_differs_from_the_product_that_would_be_the_spectrum():
+    """I * shift(I, d) has three factors and is the triple correlation.
+
+    Substituting it for the window returns the right shape and the wrong
+    numbers, so the difference is worth pinning rather than assuming.
+    """
+    rng = np.random.default_rng(19)
+    I = rng.integers(1, 9, size=(3, 3)).astype(np.int64)
+    pad = pad_shape(I)
+    flat = embed(I, pad)
+    d = (1, 1)
+    window = _masked_copy(I, pad, *d)
+    product = flat * np.roll(flat, -(d[0] * pad[1] + d[1]))
+    assert not np.array_equal(window, product)
+
+
+def test_masked_copy_at_zero_is_the_embedded_image():
+    I = np.arange(1, 10, dtype=np.int64).reshape(3, 3)
+    pad = pad_shape(I)
+    assert np.array_equal(_masked_copy(I, pad, 0, 0), embed(I, pad))
+
+
+def test_masked_copy_on_a_wide_image_uses_the_wide_stride():
+    """cols != W here, so a stride taken from the image would misalign."""
+    I = np.arange(1, 15, dtype=np.int64).reshape(2, 7)
+    pad = pad_shape(I)
+    assert pad[1] > I.shape[1]
+    got = _masked_copy(I, pad, 0, 1).reshape(pad)
+    want = np.zeros(pad, dtype=np.int64)
+    want[:2, :6] = I[:2, 1:7]
+    assert np.array_equal(got, want)
+
+
+@pytest.mark.parametrize("shape", [
+    (2, 2), (3, 3), (4, 4), (2, 5), (5, 2), (3, 4), (4, 3), (6, 4),
+])
+def test_row_sums_mod_equals_the_reference_mod_p(shape):
+    rng = np.random.default_rng(20)
+    I = rng.integers(0, 7, size=shape).astype(np.int64)
+    p, root = 998244353, 3
+    assert np.array_equal(row_sums_mod(I, p, root),
+                          np.array(definition.jacobian_row_sums(I)) % p)
+
+
+@pytest.mark.parametrize("shape", [
+    (2, 2), (3, 3), (4, 4), (2, 5), (5, 2), (3, 4), (4, 3), (6, 4),
+])
+def test_jacobian_row_sums_ntt_equals_the_reference_exactly(shape):
+    """Integer equality: the row sums are counts, so a tolerance would let an
+    off-by-three or a dropped pair pass."""
+    rng = np.random.default_rng(21)
+    I = rng.integers(0, 7, size=shape).astype(np.int64)
+    assert jacobian_row_sums_ntt(I) == list(definition.jacobian_row_sums(I))
+
+
+def test_row_sums_on_a_wide_and_a_tall_image():
+    """Non-square, so the read-back stride and the mask both matter."""
+    rng = np.random.default_rng(22)
+    for shape in [(2, 7), (7, 2), (2, 16), (16, 2), (3, 9), (9, 3)]:
+        I = rng.integers(0, 7, size=shape).astype(np.int64)
+        assert jacobian_row_sums_ntt(I) == list(definition.jacobian_row_sums(I))
+
+
+def test_row_sums_of_a_zero_image_are_zero():
+    I = np.zeros((3, 3), dtype=np.int64)
+    assert jacobian_row_sums_ntt(I) == list(definition.jacobian_row_sums(I))
+
+
+def test_row_sums_of_a_single_lit_pixel_match_the_reference():
+    I = np.zeros((3, 3), dtype=np.int64)
+    I[1, 1] = 1
+    assert jacobian_row_sums_ntt(I) == list(definition.jacobian_row_sums(I))
+
+
+def test_row_sums_with_a_bounded_max_value_are_still_exact():
+    I = np.full((3, 3), 7, dtype=np.int64)
+    assert jacobian_row_sums_ntt(I, max_value=7) == list(
+        definition.jacobian_row_sums(I))
+
+
+def test_row_sums_need_more_than_one_prime_for_bright_pixels():
+    """A single prime would return a residue rather than the count."""
+    I = np.full((3, 3), 255, dtype=np.int64)
+    assert len(primes_for_row_sums(I)) > 1
+
+
+def test_row_sums_reject_3d_with_a_reason():
+    with pytest.raises(UnsupportedDimension, match="2D"):
+        jacobian_row_sums_ntt(np.ones((2, 2, 2), dtype=np.int64))
+
+
+def test_row_sum_bound_exceeds_every_row_sum():
+    rng = np.random.default_rng(23)
+    for shape in [(2, 2), (3, 3), (4, 4), (2, 5), (3, 4)]:
+        for I in (np.full(shape, 255, dtype=np.int64),
+                  rng.integers(0, 255, size=shape).astype(np.int64)):
+            assert max(definition.jacobian_row_sums(I)) <= row_sum_bound(I)
+
+
+def test_row_sum_bound_counts_all_three_pairs_of_a_triple():
+    """Three, not one: a row sum collects I[a]I[b] + I[a]I[c] + I[b]I[c]."""
+    I = np.zeros((3, 3), dtype=np.int64)
+    pairs = ((2 * 3 - 1) * (2 * 3 - 1)) ** 2
+    assert row_sum_bound(I, max_value=1) == 3 * pairs * I.size
+
+
+def test_row_sum_bound_is_quadratic_in_the_pixel_range():
+    """Two factors, not three: the row sums drop the third power."""
+    I = np.zeros((3, 3), dtype=np.int64)
+    assert (row_sum_bound(I, max_value=100)
+            == 100 * row_sum_bound(I, max_value=10))
+
+
+def test_row_sum_bound_grows_with_the_number_of_offset_pairs():
+    small = row_sum_bound(np.zeros((3, 3), dtype=np.int64), max_value=9)
+    large = row_sum_bound(np.zeros((4, 4), dtype=np.int64), max_value=9)
+    assert large > small
+
+
+def test_row_sum_bound_ignores_the_pixel_values():
+    I = np.zeros((3, 3), dtype=np.int64)
+    assert row_sum_bound(I) == row_sum_bound(I, max_value=None)
+
+
+def test_undersizing_the_row_sum_bound_is_detectable():
+    """One prime short of the bound gives a plausible wrong answer, so the
+    bound has to be an upper bound rather than an estimate."""
+    I = np.full((3, 3), 4, dtype=np.int64)
+    exact = jacobian_row_sums_ntt(I, max_value=4)
+    p = primes_for_row_sums(I, max_value=4)[0][0]
+    assert any(v >= p for v in exact)
+
+
+# ---------------------------------------------------------------------------
+# the gradient
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("shape", [
+    (2, 2), (3, 3), (4, 4), (2, 5), (5, 2), (3, 4), (4, 3), (6, 4),
+])
+def test_spectrum_gradient_ntt_matches_the_reference(shape):
+    """A tolerance, unlike the spectrum: the residual weights are floats."""
+    rng = np.random.default_rng(24)
+    I = rng.integers(1, 7, size=shape).astype(np.int64)
+    target = area_spectrum(rng.integers(1, 7, size=shape).astype(np.int64))
+    scale = definition.jacobian_row_sums(I)
+    got = np.array(spectrum_gradient_ntt(I, target, scale))
+    want = np.array(definition.spectrum_gradient(I, target, scale))
+    assert got.shape == want.shape == (I.size,)
+    assert np.allclose(got, want, rtol=1e-9, atol=1e-7)
+
+
+def test_spectrum_gradient_on_a_wide_and_a_tall_image():
+    """Non-square, so the read-back has to use the padded stride."""
+    rng = np.random.default_rng(25)
+    for shape in [(2, 7), (7, 2), (2, 16), (16, 2), (3, 9), (9, 3)]:
+        I = rng.integers(1, 7, size=shape).astype(np.int64)
+        target = area_spectrum(rng.integers(1, 7, size=shape).astype(np.int64))
+        scale = definition.jacobian_row_sums(I)
+        got = np.array(spectrum_gradient_ntt(I, target, scale))
+        want = np.array(definition.spectrum_gradient(I, target, scale))
+        assert np.allclose(got, want, rtol=1e-9, atol=1e-7)
+
+
+def test_spectrum_gradient_vanishes_against_its_own_spectrum():
+    rng = np.random.default_rng(26)
+    I = rng.integers(1, 7, size=(3, 3)).astype(np.int64)
+    spec = area_spectrum(I)
+    scale = definition.jacobian_row_sums(I)
+    got = np.array(spectrum_gradient_ntt(I, spec, scale))
+    assert np.allclose(got, 0.0, atol=1e-9)
+
+
+def test_spectrum_gradient_of_a_zero_image_is_zero():
+    I = np.zeros((3, 3), dtype=np.int64)
+    target = area_spectrum(np.ones((3, 3), dtype=np.int64))
+    got = np.array(spectrum_gradient_ntt(I, target,
+                                         definition.jacobian_row_sums(I)))
+    assert np.allclose(got, 0.0, atol=1e-12)
+
+
+def test_spectrum_gradient_is_exactly_the_adjoint_of_the_spectrum():
+    """A single-pixel step is an exact linear functional of the gradient.
+
+    The spectrum is multilinear -- every term is a product of distinct pixel
+    values -- so it is linear in any one pixel, and definition.spectrum_gradient
+    is an exact adjoint rather than a first-order one. The directional
+    derivative of the loss along a step at a single pixel is therefore *exactly*
+    sum_k w[k] * dA[k], with no epsilon and no truncation, and it must equal
+    grad[p] * step.
+
+    Two details make the obvious version of this test wrong. A float step is
+    no use, because area_spectrum reads int(I[v]) and would truncate the
+    perturbation away. A multi-pixel direction fails too: the spectrum is
+    multilinear, not linear, so a step touching two pixels carries cross terms
+    the gradient does not see. One pixel at a time is the only exact direction.
+
+    This exercises the gradient as a linear functional of the spectrum, so a
+    sign or factor error that cancelled entry-wise against the reference would
+    not cancel here.
+    """
+    rng = np.random.default_rng(27)
+    I = rng.integers(2, 6, size=(3, 3)).astype(np.int64)
+    target = area_spectrum(rng.integers(1, 6, size=(3, 3)).astype(np.int64))
+    scale = definition.jacobian_row_sums(I)
+    base = np.array(area_spectrum(I), dtype=np.float64)
+    w = np.array(definition.spectrum_residual_weights(base.tolist(), target,
+                                                     scale))
+    grad = np.array(spectrum_gradient_ntt(I, target, scale))
+    for y, x, step in [(0, 0, 5), (1, 2, -3), (2, 2, 2), (0, 1, 4)]:
+        moved = I.copy()
+        moved[y, x] += step
+        exact = float(w @ (np.array(area_spectrum(moved), dtype=np.float64)
+                          - base))
+        assert math.isclose(exact, float(grad[y * I.shape[1] + x]) * step,
+                            rel_tol=1e-9, abs_tol=1e-12)
+
+
+def test_spectrum_gradient_rejects_3d_with_a_reason():
+    with pytest.raises(UnsupportedDimension, match="2D"):
+        spectrum_gradient_ntt(np.ones((2, 2, 2), dtype=np.int64), [], [1, 2, 3])
+
+
+# ---------------------------------------------------------------------------
+# the backend, with all three quantities on the correlation path
+# ---------------------------------------------------------------------------
+
+def test_backend_row_sums_match_the_reference():
+    rng = np.random.default_rng(28)
+    I = rng.integers(0, 7, size=(3, 3)).astype(np.int64)
+    assert NTTBackend().jacobian_row_sums(I) == list(
+        definition.jacobian_row_sums(I))
+
+
+def test_backend_gradient_matches_the_reference():
+    rng = np.random.default_rng(29)
+    I = rng.integers(1, 7, size=(3, 3)).astype(np.int64)
+    target = area_spectrum(rng.integers(1, 7, size=(3, 3)).astype(np.int64))
+    scale = definition.jacobian_row_sums(I)
+    got = np.array(NTTBackend().spectrum_gradient(I, target, scale))
+    want = np.array(definition.spectrum_gradient(I, target, scale))
+    assert np.allclose(got, want, rtol=1e-9, atol=1e-7)
+
+
+def test_backend_row_sums_pass_max_value_through():
+    I = np.full((3, 3), 3, dtype=np.int64)
+    assert NTTBackend(max_value=3).jacobian_row_sums(I) == list(
+        definition.jacobian_row_sums(I))
+
+
+def test_backend_does_not_delegate_the_row_sums_or_the_gradient():
+    """The seam has to be a real seam, not a thin wrapper over definition."""
+    rng = np.random.default_rng(30)
+    I = rng.integers(1, 7, size=(3, 3)).astype(np.int64)
+    target = area_spectrum(rng.integers(1, 7, size=(3, 3)).astype(np.int64))
+    scale = definition.jacobian_row_sums(I)
+    called = []
+    originals = (definition.jacobian_row_sums, definition.spectrum_gradient)
+    definition.jacobian_row_sums = lambda *a, **k: called.append("row_sums")
+    definition.spectrum_gradient = lambda *a, **k: called.append("gradient")
+    try:
+        NTTBackend().jacobian_row_sums(I)
+        NTTBackend().spectrum_gradient(I, target, scale)
+    finally:
+        (definition.jacobian_row_sums,
+         definition.spectrum_gradient) = originals
+    assert called == []
+
+
+def test_bin_bound_counts_every_offset_pair():
+    """The pair factor is ((2H-1)(2W-1))**2, not (2H-1)(2W-1)**2.
+
+    The older formula counted pairs as if only the row coordinate were
+    squared. It is a third of the total for a 3x3 and, more to the point,
+    smaller than the worst *single* bin at 2x2, 3x3 and 4x4: 40 of 81 pairs
+    land in one bin of a 2x2 against the 27 quoted. Nothing caught it because
+    the maxval**3 slack in the bound is enormous for uint8; it is a bound that
+    happens to hold, not a bound that is derived.
+    """
+    for shape, pairs in [((2, 2), 81), ((3, 3), 625), ((4, 4), 2401)]:
+        I = np.zeros(shape, dtype=np.int64)
+        H, W = shape
+        assert bin_bound(I, max_value=1) == ((2 * H - 1) * (2 * W - 1)) ** 2 * I.size
+        assert bin_bound(I, max_value=1) == pairs * I.size
+
+
+def test_bin_bound_covers_the_worst_single_bin_of_a_small_image():
+    """A direct count, so the pair factor cannot be weakened unnoticed."""
+    for shape in [(2, 2), (3, 3), (4, 4)]:
+        H, W = shape
+        per_bin = Counter(
+            abs(d1y * d2x - d1x * d2y)
+            for d1y in range(-(H - 1), H) for d1x in range(-(W - 1), W)
+            if (d1y, d1x) != (0, 0)
+            for d2y in range(-(H - 1), H) for d2x in range(-(W - 1), W)
+            if (d2y, d2x) != (0, 0) and (d2y, d2x) != (d1y, d1x))
+        worst = max(per_bin.values())
+        I = np.zeros(shape, dtype=np.int64)
+        assert bin_bound(I, max_value=1) >= worst * I.size, shape
+
+
+@pytest.mark.parametrize("fn", [area_spectrum_ntt, jacobian_row_sums_ntt])
+def test_crt_paths_refuse_a_negative_pixel(fn):
+    """CRT returns a value in [0, product), so a negative bin cannot appear.
+
+    Without the guard the answer is an ordinary-looking integer of the wrong
+    size rather than an error: a bin of -84 came back as 186253. Nothing
+    downstream can tell, which is why this is a refusal and not a warning.
+    """
+    I = np.array([[-2, 3], [4, -5]], dtype=np.int64)
+    with pytest.raises(ValueError, match="negative"):
+        fn(I, max_value=5)
+
+
+def test_a_negative_pixel_is_refused_rather_than_silently_wrapped():
+    """The shape of the failure that motivated the guard."""
+    I = np.array([[-2, 3], [4, -5]], dtype=np.int64)
+    assert min(definition.area_spectrum(I)) < 0
+    # and the reference is exact over the integers, negatives included
+    assert definition.area_spectrum(I)[1] == -84
+
+
+def test_the_gradient_still_handles_a_negative_image():
+    """The float FFT carries the sign; only the CRT paths refuse negatives.
+
+    The spectrum is passed in from definition.py, which is exact over the
+    integers, since the default would go through the CRT path and refuse.
+    """
+    I = np.array([[-2, 3], [4, -5]], dtype=np.int64)
+    target = area_spectrum(np.array([[1, 2], [3, 4]], dtype=np.int64))
+    scale = definition.jacobian_row_sums(I)
+    got = np.array(spectrum_gradient_ntt(I, target, scale,
+                                         spectrum=definition.area_spectrum(I)))
+    want = np.array(definition.spectrum_gradient(I, target, scale))
+    assert np.allclose(got, want)
+
+
+@pytest.mark.parametrize("fn", [area_spectrum_ntt, jacobian_row_sums_ntt])
+def test_crt_paths_accept_a_zero_image(fn):
+    """Zero is the boundary: min() == 0 must not trip the guard."""
+    I = np.zeros((2, 2), dtype=np.int64)
+    fn(I, max_value=1)
+
+
+def test_the_gradient_never_falls_back_to_the_reference_spectrum():
+    """It is the one place that could put the O(p**3) walk back.
+
+    The weights need the spectrum of I, and reaching for definition there would
+    defeat the whole function. The reference is stubbed to fail so a fallback
+    is loud rather than merely slow.
+    """
+    rng = np.random.default_rng(31)
+    I = rng.integers(1, 7, size=(3, 3)).astype(np.int64)
+    target = area_spectrum(rng.integers(1, 7, size=(3, 3)).astype(np.int64))
+    scale = definition.jacobian_row_sums(I)
+    original = definition.area_spectrum
+    definition.area_spectrum = lambda *a, **k: pytest.fail(
+        "the gradient called the reference spectrum")
+    try:
+        spectrum_gradient_ntt(I, target, scale)
+        NTTBackend().spectrum_gradient(I, target, scale)
+    finally:
+        definition.area_spectrum = original
+
+
+def test_the_gradient_accepts_a_spectrum_from_the_caller():
+    rng = np.random.default_rng(32)
+    I = rng.integers(1, 7, size=(3, 3)).astype(np.int64)
+    target = area_spectrum(rng.integers(1, 7, size=(3, 3)).astype(np.int64))
+    scale = definition.jacobian_row_sums(I)
+    want = np.array(definition.spectrum_gradient(I, target, scale))
+    got = np.array(spectrum_gradient_ntt(I, target, scale,
+                                         spectrum=area_spectrum(I)))
+    assert np.allclose(got, want, rtol=1e-9, atol=1e-7)
+
+
+def test_backend_reuses_the_spectrum_it_already_computed():
+    """descent asks for the spectrum and then the gradient of the same image."""
+    rng = np.random.default_rng(33)
+    I = rng.integers(1, 7, size=(3, 3)).astype(np.int64)
+    target = area_spectrum(rng.integers(1, 7, size=(3, 3)).astype(np.int64))
+    scale = definition.jacobian_row_sums(I)
+    backend = NTTBackend()
+    backend.area_spectrum(I)                 # now cached
+    calls = []
+    real = ntt_spectrum.area_spectrum_ntt
+    ntt_spectrum.area_spectrum_ntt = lambda *a, **k: calls.append(1) or real(*a, **k)
+    try:
+        got = np.array(backend.spectrum_gradient(I, target, scale))
+    finally:
+        ntt_spectrum.area_spectrum_ntt = real
+    assert calls == [], "the cached spectrum was not used"
+    want = np.array(definition.spectrum_gradient(I, target, scale))
+    assert np.allclose(got, want, rtol=1e-9, atol=1e-7)
+
+
+def test_backend_does_not_reuse_a_spectrum_from_another_image():
+    """A stale cache entry would silently weight the wrong spectrum."""
+    rng = np.random.default_rng(34)
+    I = rng.integers(1, 7, size=(3, 3)).astype(np.int64)
+    J = rng.integers(1, 7, size=(3, 3)).astype(np.int64)
+    target = area_spectrum(rng.integers(1, 7, size=(3, 3)).astype(np.int64))
+    scale = definition.jacobian_row_sums(I)
+    backend = NTTBackend()
+    backend.area_spectrum(I)                 # caches I, not J
+    got = np.array(backend.spectrum_gradient(J, target, scale))
+    want = np.array(definition.spectrum_gradient(J, target, scale))
+    assert np.allclose(got, want, rtol=1e-9, atol=1e-7)

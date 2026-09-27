@@ -214,9 +214,16 @@ def bin_bound(I, max_value=None):
 
     A bin sums T(d1, d2) over the offset pairs landing in it. T is nonzero only
     for offsets that fit inside the image, so it has at most I.size terms, each
-    at most maxval**3; and there are at most (2H-1)*(2W-1)**2 offset pairs in
+    at most maxval**3; and there are at most ((2H-1)*(2W-1))**2 offset pairs in
     all. The product of the chosen primes must exceed this, or CRT reconstructs
     a residue rather than the count.
+
+    The pair count is the total, not the largest bin, because the largest bin is
+    not known without enumerating the determinants. (2H-1)*(2W-1)**2, which
+    counts pairs as if only the row coordinate were squared, is a third of the
+    total for a 3x3 and undercounts the worst single bin outright at 2x2, 3x3
+    and 4x4: 40 pairs share one bin of a 2x2 against a 27 quoted. It happens
+    not to bite for uint8, whose maxval**3 slack is large, but it is not a bound.
 
     Deliberately blind to the actual pixels: that is what lets the prime set be
     cached per (shape, dtype), and it costs only that a dim image is charged for
@@ -229,8 +236,23 @@ def bin_bound(I, max_value=None):
     H, W = I.shape
     if max_value is None:
         max_value = dtype_max(I.dtype)
-    pairs = (2 * H - 1) * (2 * W - 1) ** 2
+    pairs = ((2 * H - 1) * (2 * W - 1)) ** 2
     return pairs * I.size * max(int(max_value), 1) ** 3
+
+
+def row_sum_bound(I, max_value=None):
+    """A provable upper bound on any single row-sum entry.
+
+    A row-sum entry is a sum of the same terms as a spectrum bin but with two
+    factors instead of three, so the count is the same and only the power of
+    maxval drops, from 3 to 2. The factor 3 belongs to it as well: a row sum
+    collects all three pairs of each triple, not one.
+    """
+    H, W = I.shape
+    if max_value is None:
+        max_value = dtype_max(I.dtype)
+    pairs = ((2 * H - 1) * (2 * W - 1)) ** 2
+    return 3 * pairs * I.size * max(int(max_value), 1) ** 2
 
 
 @functools.lru_cache(maxsize=None)
@@ -438,6 +460,155 @@ def spectrum_mod(I, p, root, pad=None):
     return A
 
 
+def _masked_copy(I, pad, dy, dx):
+    """I with the anchors whose partner a+d stays in the image, flattened.
+
+    The rectangle of surviving anchors is a slice of the padded array, so this
+    is a couple of numpy assignments rather than a per-pixel test. It is
+    *not* a shift: the entries where the partner leaves the image read zero
+    instead of a wrapped neighbour, which is what makes the row sums below
+    correct.
+    """
+    rows, cols = pad
+    H, W = I.shape
+    out = np.zeros((rows, cols), dtype=np.int64)
+    # The surviving anchors a (those with a+d still in the image) are the
+    # rectangle [max(0,-dy), H-max(0,dy)) x [max(0,-dx), W-max(0,dx)), which
+    # sits at the same offsets in the padded output. The source values are the
+    # same rectangle read at a+d, i.e. shifted by +d.
+    y0, x0 = max(0, -dy), max(0, -dx)
+    y1, x1 = min(H, H - dy), min(W, W - dx)
+    out[y0:y1, x0:x1] = I[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
+    return out.ravel()
+
+
+def row_sums_mod(I, p, root, pad=None):
+    """The Jacobian row sums of I, mod p, as spectrum_mod is the spectrum.
+
+    A row sum is the gradient of a bin with respect to a pixel, so it is that
+    bin's triples with two of the three factors kept instead of three. The
+    reference walks triples; here the anchor is summed out by a correlation
+    instead.
+
+    Two things differ from the spectrum and both are load-bearing:
+
+    The kernel is a *masked* copy of I, not I * shift(I, d1). The latter is
+    the three-point correlation -- it has three factors, so it is the spectrum
+    and not the row sums. What is wanted is the two-point sum over v and v+d2
+    restricted to anchors where v+d1 is still in the image, and the restriction
+    is a mask. Using the unmasked product gives the right shape and the wrong
+    numbers, silently.
+
+    The loop runs over offset *pairs* (d1, d2) rather than over the two factors
+    of one, and the factor of 3 is applied at the end. Each triple contributes
+    I[a]I[b] + I[a]I[c] + I[b]I[c] to its bin, which cyclic symmetry of the
+    three offsets makes exactly three times the I[a]I[c] term the loop already
+    counted -- so multiplying once at the end is right, and multiplying per
+    iteration would be wrong. The same 3 belongs to the gradient, for the
+    unrelated reason that a triple moves all three of its pixels.
+    """
+    if pad is None:
+        pad = pad_shape(I)
+    rows, cols = pad
+    N = rows * cols
+    n_spectrum = definition.spectrum_length(I)
+    dy, dx, valid = _offsets(pad, I.shape)
+    R = np.zeros(n_spectrum, dtype=np.int64)
+    Ihat = ntt(embed(I, pad), p, root)
+    flat_idx = np.arange(N)
+    neg = (-flat_idx) % N
+    for s1 in np.nonzero(valid)[0]:
+        s1 = int(s1)
+        if s1 == 0:
+            continue                       # d1 == 0 repeats a point
+        b1y, b1x = int(dy[s1]), int(dx[s1])
+        # the second point of each triple; the third is the d2 being binned
+        bins = np.abs(dy * b1x - dx * b1y)
+        keep = valid & (bins < n_spectrum) & (flat_idx != s1)
+        keep[0] = False                    # d2 == 0 repeats v0
+        # B[d2] = sum_a K[a] I[a+d2] with K the masked copy: one correlation
+        K = ntt(_masked_copy(I, pad, b1y, b1x), p, root)
+        B = intt(K[neg] * Ihat % p, p, root)
+        np.add.at(R, bins[keep], B[keep])
+        # R is int64 and accumulates one residue per offset, so on a large
+        # image the running sum can exceed int64 before the final reduction.
+        # Cheap here -- n_spectrum entries against a transform of length N.
+        R %= p
+    return 3 * R % p
+
+
+def spectrum_gradient_ntt(I, target, scale, pad=None, spectrum=None):
+    """The spectrum gradient of I against target, via per-offset correlations.
+
+    definition.spectrum_gradient walks every triple and differentiates it
+    three ways. Written in offsets that is, for each ordered pair of distinct
+    non-zero offsets (d1, d2) with k = |det(d1, d2)| in range, a contribution
+
+        3 * w[k] * I[a + d1] * I[a + d2]      to every anchor a
+
+    where w is the residual weight. Holding d1 fixed, the weight depends on d2
+    only through a single scalar per d2, so the whole inner sum is a
+    correlation against the kernel h[d2] = w[|det(d1, d2)|]:
+
+        S_d1 = sum_{d2} h[d2] I[a + d2]        one transform, not one per pair
+        grad += 3 * shift(I, d1) * S_d1
+
+    With O(p) offsets and one length-O(p) transform each, that is
+    O(p**2 log p) against the reference's O(p**3). The weights are floats, so
+    this path uses numpy's float FFT rather than the NTT and returns a float
+    vector; it is exact only up to rounding.
+
+    The weights need the spectrum of I, which costs another O(p**2 log p).
+    spectrum passes one in for a caller that has just computed it; the default
+    is the fast spectrum, never definition.area_spectrum -- reaching for the
+    reference there would put the O(p**3) enumeration back inside the one
+    function that is supposed to have removed it.
+    """
+    I = np.asarray(I)
+    if I.ndim != 2:
+        raise UnsupportedDimension(
+            f"the gradient follows the triple correlation and so reaches 2D "
+            f"only, not {I.ndim}D"
+        )
+    if pad is None:
+        pad = pad_shape(I)
+    rows, cols = pad
+    H, W = I.shape
+    n_spectrum = definition.spectrum_length(I)
+    if spectrum is None:
+        spectrum = area_spectrum_ntt(I, pad)
+    w = np.asarray(definition.spectrum_residual_weights(spectrum, target, scale),
+                   dtype=np.float64)
+    dy, dx, valid = _offsets(pad, I.shape)
+    flat = embed(I, pad).astype(np.float64)
+    Ifft = np.fft.fft(flat)
+    idx = np.arange(rows * cols)
+    grad = np.zeros(rows * cols, dtype=np.float64)
+    for s1 in np.nonzero(valid)[0]:
+        s1 = int(s1)
+        if s1 == 0:
+            continue
+        b1y, b1x = int(dy[s1]), int(dx[s1])
+        bins = np.abs(dy * b1x - dx * b1y)
+        keep = valid & (bins < n_spectrum) & (idx != s1)
+        keep[0] = False
+        if not keep.any():
+            continue
+        # kernel over d2: one float weight per valid offset, zero elsewhere
+        h = np.zeros(rows * cols, dtype=np.float64)
+        h[keep] = w[bins[keep]]
+        # sum_d2 h[d2] I[a + d2]; the negation is on h, as in triple_correlation
+        S = np.fft.ifft(np.fft.fft(h)[(-idx) % (rows * cols)] * Ifft).real
+        # np.roll by -shift gives flat[v + shift]; correct on the image for any
+        # offset in range, and the padding it gets wrong is never read back
+        grad += 3.0 * np.roll(flat, -s1) * S
+    # read back only the image, which is the top-left H x W corner of the
+    # padded frame -- not the first H*W flat entries, which would be the image
+    # plus a slice of the first padding row whenever cols > W
+    image = np.arange(rows * cols).reshape(rows, cols)[:H, :W]
+    return grad[image.ravel()]
+
+
 def crt(residues, primes):
     """Exact reconstruction from residues mod pairwise coprime primes.
 
@@ -471,6 +642,29 @@ def primes_for(I, max_value=None):
     return [(p, primitive_root(p)) for p in chosen]
 
 
+def _check_nonneg(I):
+    """Reject a negative pixel, which the CRT path cannot represent.
+
+    crt returns the unique value in [0, product) matching the residues, so a
+    bin whose true value is negative comes back as its residue minus the
+    modulus product instead. Nothing downstream can tell: the answer is an
+    ordinary-looking integer of the wrong size, which is worse than a refusal.
+    The float paths (the gradient) have no such trouble and do not call this.
+
+    A signed reconstruction would recover these, but the products then have to
+    cover a range on both sides of zero and the bounds below would need
+    doubling; the images this module is aimed at are counts, so the guard is
+    the honest cheap answer for now.
+    """
+    if I.size and int(I.min()) < 0:
+        raise ValueError(
+            f"the NTT path reconstructs bins by CRT, which returns a value in "
+            f"[0, product) and so cannot represent a negative one; this image "
+            f"has a pixel of {int(I.min())}. Shift it nonneg, or use "
+            f"definition.py, which is exact over the integers."
+        )
+
+
 def area_spectrum_ntt(I, pad=None, primes=None, max_value=None):
     """The exact area spectrum of I, via sections and CRT.
 
@@ -488,33 +682,85 @@ def area_spectrum_ntt(I, pad=None, primes=None, max_value=None):
         )
     if primes is None:
         primes = primes_for(I, max_value)
+    _check_nonneg(I)
     residues = [spectrum_mod(I, p, root, pad) for p, root in primes]
     ps = [p for p, _ in primes]
     return [crt([r[k] for r in residues], ps) for k in
             range(definition.spectrum_length(I))]
 
 
-class NTTBackend:
-    """A descent backend whose spectrum comes from the NTT path.
+def primes_for_row_sums(I, max_value=None):
+    """The primes the row sums of I need, as (prime, primitive root) pairs.
 
-    Satisfies descent.SpectrumBackend. The spectrum is the fast one; the row
-    sums and the gradient are delegated to definition.py. That asymmetry is
-    deliberate and is not a speed claim -- descent calls the gradient once per
-    iteration and evaluates the loss once per candidate, so this backend
-    demonstrates that the seam works against a genuinely different
-    implementation rather than delivering an end-to-end speedup.
+    Separate from primes_for because the bound is a different power of the
+    value -- quadratic rather than cubic -- so the two quantities can need
+    different prime counts, and picking the wrong one leaves CRT reconstructing
+    a residue instead of a count.
+
+    The "row-sums" tag on the cache key is belt and braces rather than the
+    thing that keeps them apart: the bound is already part of the key, so a
+    row-sum search cannot collide with a spectrum search unless the two bounds
+    agree. The tag is there to stop that happening by accident if a bound is
+    ever loosened to match, and to keep the two entries from evicting each
+    other out of the cache.
+    """
+    I = np.asarray(I)
+    bound = row_sum_bound(I, max_value)
+    key = (I.dtype.str, int(max_value)) if max_value is not None else I.dtype.str
+    chosen = primes_for_shape(tuple(I.shape), ("row-sums", key), bound)
+    return [(p, primitive_root(p)) for p in chosen]
+
+
+def jacobian_row_sums_ntt(I, pad=None, primes=None, max_value=None):
+    """The exact Jacobian row sums of I, via correlations and CRT.
+
+    Equals definition.jacobian_row_sums(I) exactly, in integers.
+    """
+    I = np.asarray(I)
+    if I.ndim != 2:
+        raise UnsupportedDimension(
+            f"row sums follow the triple correlation and so reach 2D only, "
+            f"not {I.ndim}D"
+        )
+    _check_nonneg(I)
+    if primes is None:
+        primes = primes_for_row_sums(I, max_value)
+    residues = [row_sums_mod(I, p, root, pad) for p, root in primes]
+    ps = [p for p, _ in primes]
+    return [crt([r[k] for r in residues], ps) for k in
+            range(definition.spectrum_length(I))]
+
+
+class NTTBackend:
+    """A descent backend with every quantity on the correlation path.
+
+    Satisfies descent.SpectrumBackend. The spectrum and the row sums are the
+    exact integers of definition.py, reached by correlation and CRT; the
+    gradient is a float vector from numpy's FFT, equal to
+    definition.spectrum_gradient up to rounding. The gradient is the one part
+    that cannot be exact, because the weights themselves are floats.
     """
 
     def __init__(self, pad=None, primes=None, max_value=None):
         self.pad = pad
         self.primes = primes
         self.max_value = max_value
+        # descent evaluates the loss of a candidate and then its gradient at
+        # the accepted image, so the spectrum of the current image is usually
+        # already in hand; caching it here keeps the gradient from paying for a
+        # second pass. Keyed by id, so it holds one image's worth and nothing
+        # grows with the number of steps.
+        self._spectrum = None
+        self._spectrum_for = None
 
     def area_spectrum(self, I):
-        return area_spectrum_ntt(I, self.pad, self.primes, self.max_value)
+        out = area_spectrum_ntt(I, self.pad, self.primes, self.max_value)
+        self._spectrum, self._spectrum_for = out, id(I)
+        return out
 
     def jacobian_row_sums(self, I):
-        return definition.jacobian_row_sums(I)
+        return jacobian_row_sums_ntt(I, self.pad, self.primes, self.max_value)
 
     def spectrum_gradient(self, I, target, scale):
-        return definition.spectrum_gradient(I, target, scale)
+        spectrum = self._spectrum if self._spectrum_for == id(I) else None
+        return spectrum_gradient_ntt(I, target, scale, self.pad, spectrum)
