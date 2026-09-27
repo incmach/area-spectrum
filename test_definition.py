@@ -11,6 +11,10 @@ VOLUME = definition.volume
 AREA_SPECTRUM = definition.area_spectrum
 ROW_SUMS = definition.jacobian_row_sums
 GRADIENT = definition.normalized_spectrum_gradient
+LOSS = definition.spectrum_loss
+SPEC_GRADIENT = definition.spectrum_gradient
+DIRECTION = definition.integer_gradient_direction
+DESCENT = definition.descent
 
 
 # ---------------------------------------------------------------------------
@@ -21,12 +25,13 @@ def _reference_rows(I):
     """Full Jacobian rows: rows[k][p] = d area_spectrum[k] / d I[p].
 
     Independent of definition.py: accumulates the product rule per pixel into
-    a dict instead of using prefix/suffix products.
+    a dict instead of using prefix/suffix products. Like area_spectrum, the
+    tuple's points are distinct.
     """
     coords = list(np.ndindex(I.shape))
     d = len(I.shape)
     rows = [dict() for _ in range(definition.spectrum_length(I))]
-    for S in itertools.product(coords, repeat=d + 1):
+    for S in itertools.permutations(coords, d + 1):
         k = VOLUME(S)
         vals = [int(I[v]) for v in S]
         m = len(vals)
@@ -45,12 +50,12 @@ def _spectrum_float(I):
 
     area_spectrum casts with int(), which makes it a step function, so its
     finite differences vanish. This is the polynomial relaxation the gradient
-    is actually the derivative of.
+    is the derivative of. Like area_spectrum, the tuple's points are distinct.
     """
     coords = list(np.ndindex(I.shape))
     d = len(I.shape)
     result = [0.0] * definition.spectrum_length(I)
-    for S in itertools.product(coords, repeat=d + 1):
+    for S in itertools.permutations(coords, d + 1):
         result[VOLUME(S)] += math.prod(float(I[v]) for v in S)
     return result
 
@@ -100,27 +105,33 @@ def test_volume_permutation_invariant():
 # ---------------------------------------------------------------------------
 
 def test_area_spectrum_ones_1x1():
-    assert AREA_SPECTRUM(np.ones((1, 1), dtype=np.uint8)) == [1]
+    # A single pixel cannot supply the 2 distinct points a 1D bin needs.
+    assert AREA_SPECTRUM(np.ones((1, 1), dtype=np.uint8)) == [0]
 
 
 def test_area_spectrum_ones_2x1():
-    assert AREA_SPECTRUM(np.ones((2, 1), dtype=np.uint8)) == [8, 0]
-    assert AREA_SPECTRUM(np.ones((1, 2), dtype=np.uint8)) == [8, 0]
+    assert AREA_SPECTRUM(np.ones((2, 1), dtype=np.uint8)) == [0, 0]
+    assert AREA_SPECTRUM(np.ones((1, 2), dtype=np.uint8)) == [0, 0]
 
 
 def test_area_spectrum_ones_2x2():
-    # 4^3 = 64 ordered triples; 4 triangles x 6 orderings = 24 with area 1
-    assert AREA_SPECTRUM(np.ones((2, 2), dtype=np.uint8)) == [40, 24, 0, 0]
+    # The 4 points give 4 choose 3 = 4 distinct triples, each with 3! = 6
+    # orderings, so 24 tuples of volume 1 and none of volume 0: no 3 distinct
+    # corners of a 2x2 are collinear.
+    assert AREA_SPECTRUM(np.ones((2, 2), dtype=np.uint8)) == [0, 24, 0, 0]
 
 
 def test_area_spectrum_ones_3x2():
-    assert AREA_SPECTRUM(np.ones((3, 2), dtype=np.uint8)) == [108, 72, 36, 0, 0, 0]
-    assert AREA_SPECTRUM(np.ones((2, 3), dtype=np.uint8)) == [108, 72, 36, 0, 0, 0]
+    # 6 points give 6*5*4 = 120 tuples of distinct points. Only the 2 rows are
+    # collinear -- a column holds just 2 points, one too few -- so bin 0 gets
+    # 2 triples x 3! orderings = 12.
+    assert AREA_SPECTRUM(np.ones((3, 2), dtype=np.uint8)) == [12, 72, 36, 0, 0, 0]
+    assert AREA_SPECTRUM(np.ones((2, 3), dtype=np.uint8)) == [12, 72, 36, 0, 0, 0]
 
 
 def test_area_spectrum_ones_3x3():
     assert AREA_SPECTRUM(np.ones((3, 3), dtype=np.uint8)) == [
-        273, 192, 192, 24, 48, 0, 0, 0, 0,
+        48, 192, 192, 24, 48, 0, 0, 0, 0,
     ]
 
 
@@ -129,8 +140,79 @@ def test_area_spectrum_zero_image():
 
 
 def test_area_spectrum_mixed():
-    assert AREA_SPECTRUM(np.array([[1, 0], [0, 1]], dtype=np.uint8)) == [8, 0, 0, 0]
-    assert AREA_SPECTRUM(np.array([[1, 1], [0, 1]], dtype=np.uint8)) == [21, 6, 0, 0]
+    # Two isolated points: no 3 distinct points, so every bin is empty.
+    assert AREA_SPECTRUM(np.array([[1, 0], [0, 1]], dtype=np.uint8)) == [0, 0, 0, 0]
+    assert AREA_SPECTRUM(np.array([[1, 1], [0, 1]], dtype=np.uint8)) == [0, 6, 0, 0]
+
+
+def area_spectrum_repeated(I):
+    """The old spectrum, over tuples that may repeat a point, for comparison."""
+    d = len(I.shape)
+    result = [0] * definition.spectrum_length(I)
+    for S in itertools.product(list(np.ndindex(I.shape)), repeat=d + 1):
+        result[VOLUME(S)] += math.prod(int(I[v]) for v in S)
+    return result
+
+
+def test_bins_above_zero_are_unchanged_by_distinct_points_only():
+    """The redefinition only ever touches bin 0.
+
+    A nonzero determinant makes a tuple affinely independent, and affine
+    independence implies the points are distinct, so requiring distinct points
+    cannot remove a tuple from any bin above 0. Checked against the
+    repeated-point spectrum, which is what the rule used to enumerate.
+    """
+    rng = np.random.default_rng(19)
+    for shape in [(2, 2), (3, 2), (3, 3), (4, 4), (2, 2, 2), (3, 3, 3)]:
+        I = rng.integers(0, 5, size=shape).astype(np.int64)
+        assert area_spectrum_repeated(I)[1:] == AREA_SPECTRUM(I)[1:], shape
+
+
+def test_redefining_bin_zero_only_removes_mass_from_bin_zero():
+    """Every tuple the rule drops has volume 0, so the total falls and no
+    other bin does. The drop is exactly the repeated-point contribution."""
+    rng = np.random.default_rng(23)
+    for shape in [(3, 3), (4, 4), (2, 2, 2)]:
+        I = rng.integers(1, 5, size=shape).astype(np.int64)
+        old = area_spectrum_repeated(I)
+        new = AREA_SPECTRUM(I)
+        assert all(o - n >= 0 for o, n in zip(old, new)), shape
+        assert new[0] <= old[0], shape
+        assert sum(old) > sum(new), shape
+
+
+def test_spectrum_is_exactly_linear_in_each_pixel():
+    """Trilinearity: a unit step's change to bin k is exactly J[k][p].
+
+    This is the property the redefinition buys. With distinct points no term
+    names a pixel twice, so the spectrum is multilinear and linear in each
+    pixel on its own -- the gradient is the exact change, not a first-order
+    approximation of it.
+    """
+    rng = np.random.default_rng(29)
+    for shape in [(3, 3), (4, 4), (3, 3, 3)]:
+        I = rng.integers(1, 6, size=shape).astype(np.int64)
+        A = AREA_SPECTRUM(I)
+        for _ in range(6):
+            p = tuple(int(x) for x in rng.integers(0, np.array(shape)))
+            J = I.copy()
+            J[p] += 1
+            delta = [a - b for a, b in zip(AREA_SPECTRUM(J), A)]
+            assert delta == _jacobian_column(I, p), (shape, p)
+
+
+def _jacobian_column(I, pixel):
+    """J[k][pixel], the exact change one unit step makes to bin k."""
+    d = len(I.shape)
+    result = [0] * definition.spectrum_length(I)
+    for S in itertools.permutations(list(np.ndindex(I.shape)), d + 1):
+        if pixel not in S:
+            continue
+        vals = [int(I[v]) for v in S]
+        i = S.index(pixel)
+        result[VOLUME(S)] += math.prod(vals[:i] + vals[i + 1:])
+    return result
+
 
 
 def test_area_spectrum_length():
@@ -157,12 +239,43 @@ def test_area_spectrum_symmetric_in_axis_swap():
     assert AREA_SPECTRUM(I) == AREA_SPECTRUM(I.T)
 
 
+def _elementary_symmetric(values, r):
+    """e_r, the r-th elementary symmetric polynomial, by the standard DP.
+
+    Sums the products of every r-subset of the values. Needed because summing
+    the spectrum now runs over tuples of distinct points, so the total is
+    (d+1)! * e_{d+1}(values) rather than a power of the sum. For all-ones that
+    reduces to (d+1)! * C(n, d+1) = n!/(n-d-1)!.
+    """
+    e = [0] * (r + 1)
+    e[0] = 1
+    for v in values:
+        for j in range(min(r, len(e) - 1), 0, -1):
+            e[j] += e[j - 1] * v
+    return e[r]
+
+
 def test_area_spectrum_mass_conservation():
+    """Summing every bin counts each ordered tuple of distinct points once.
+
+    The total is (d+1)! * e_{d+1}(values), not (sum of values)**(d+1) as it was
+    when repeated points were included.
+    """
     rng = np.random.default_rng(7)
     for shape in [(3, 3), (4, 4), (2, 2, 2)]:
         I = rng.integers(0, 4, size=shape).astype(np.int64)
-        total = sum(int(I[v]) for v in np.ndindex(shape))
-        assert sum(AREA_SPECTRUM(I)) == total ** (len(shape) + 1)
+        r = len(shape) + 1
+        assert sum(AREA_SPECTRUM(I)) == math.factorial(r) * _elementary_symmetric(
+            [int(x) for x in I.ravel()], r
+        ), shape
+
+
+def test_area_spectrum_mass_matches_falling_factorial_for_ones():
+    """The all-ones case: (d+1)! * C(n, d+1) == n!/(n-d-1)!."""
+    for shape in [(2, 2), (3, 2), (3, 3), (4, 4)]:
+        n = int(np.prod(shape))
+        r = len(shape) + 1
+        assert sum(AREA_SPECTRUM(np.ones(shape, dtype=np.uint8))) == math.perm(n, r)
 
 
 def test_area_spectrum_homogeneous():
@@ -181,11 +294,13 @@ def test_area_spectrum_homogeneous():
 # ---------------------------------------------------------------------------
 
 def test_row_sums_known_values():
-    assert ROW_SUMS(np.ones((1, 1), dtype=np.uint8)) == [3]
-    assert ROW_SUMS(np.ones((2, 1), dtype=np.uint8)) == [24, 0]
-    assert ROW_SUMS(np.ones((2, 2), dtype=np.uint8)) == [120, 72, 0, 0]
-    assert ROW_SUMS(np.ones((3, 2), dtype=np.uint8)) == [324, 216, 108, 0, 0, 0]
-    assert ROW_SUMS(np.ones((3, 3), dtype=np.uint8)) == [819, 576, 576, 72, 144, 0, 0, 0, 0]
+    # A 1x1 and a 2x1 image cannot form a tuple of 2 or 3 distinct points, so
+    # every bin is unreachable and the row sums are all zero.
+    assert ROW_SUMS(np.ones((1, 1), dtype=np.uint8)) == [0]
+    assert ROW_SUMS(np.ones((2, 1), dtype=np.uint8)) == [0, 0]
+    assert ROW_SUMS(np.ones((2, 2), dtype=np.uint8)) == [0, 72, 0, 0]
+    assert ROW_SUMS(np.ones((3, 2), dtype=np.uint8)) == [36, 216, 108, 0, 0, 0]
+    assert ROW_SUMS(np.ones((3, 3), dtype=np.uint8)) == [144, 576, 576, 72, 144, 0, 0, 0, 0]
 
 
 def test_row_sums_zero_image():
@@ -374,20 +489,33 @@ def test_dimension_multiplier_covers_all_small_shapes():
 def test_no_bin_is_dropped_3d():
     """Mass conservation catches any out-of-range sigma being silently skipped.
 
-    Kept to 2x2x2 and 2x2x3: cost grows as pixels^4.
+    Kept to 2x2x2 and 2x2x3: cost grows as pixels^4. Distinct points only, so
+    the total is (d+1)! * e_{d+1}(values).
+
+    The row-sum total is (n - d) * (d+1) * d! * e_d(values). Fix a d-subset A of
+    the n points: for A to appear as a tuple S with one point omitted, the
+    omitted point is one of the n - d outside A, its position among the d+1
+    slots is free, and A's own d points fill the rest in d! orders. Each of
+    those contributes prod(A).
     """
     rng = np.random.default_rng(37)
     for shape in [(2, 2, 2), (2, 2, 3)]:
         I = rng.integers(1, 3, size=shape).astype(np.int64)
-        total = sum(int(I[v]) for v in np.ndindex(shape))
+        values = [int(x) for x in I.ravel()]
         n_pixels = I.size
-        assert sum(AREA_SPECTRUM(I)) == total ** (len(shape) + 1)
-        assert sum(ROW_SUMS(I)) == n_pixels * (len(shape) + 1) * total ** len(shape)
+        d = len(shape)
+        assert sum(AREA_SPECTRUM(I)) == math.factorial(d + 1) * _elementary_symmetric(
+            values, d + 1
+        ), shape
+        assert sum(ROW_SUMS(I)) == (n_pixels - d) * (d + 1) * math.factorial(
+            d
+        ) * _elementary_symmetric(values, d), shape
 
 
 def test_all_one_image_has_no_dead_bins_below_support():
-    """The all-one image populates every bin in 0..(W-1)(H-1)."""
-    for shape in [(2, 2), (3, 3), (4, 4), (5, 4), (8, 5), (6, 6)]:
+    """The all-one image populates every bin in 0..(W-1)(H-1), once it is
+    big enough to hold 3 collinear distinct points -- a 2x2 has none."""
+    for shape in [(3, 3), (4, 4), (5, 4), (8, 5), (6, 6)]:
         A = AREA_SPECTRUM(np.ones(shape, dtype=np.uint8))
         natural = (shape[0] - 1) * (shape[1] - 1)
         assert all(x > 0 for x in A[:natural + 1]), shape
@@ -590,3 +718,352 @@ def test_gradient_matches_reference_jacobian():
         got = GRADIENT(I, delta)
         for a, b in zip(got, expected):
             assert math.isclose(a, b, rel_tol=1e-12, abs_tol=1e-9), (shape, a, b)
+
+
+def test_bin_zero_needs_three_collinear_distinct_points():
+    """A 2x2 has 4 points but no 3 of them collinear, so bin 0 is empty.
+
+    Bin 0 is the only bin the distinct-points rule can empty: a nonzero
+    determinant already forces the points to be distinct.
+    """
+    assert AREA_SPECTRUM(np.ones((2, 2), dtype=np.uint8))[0] == 0
+    assert AREA_SPECTRUM(np.ones((2, 2), dtype=np.uint8))[1] > 0
+    assert AREA_SPECTRUM(np.ones((3, 3), dtype=np.uint8))[0] > 0
+
+
+# ---------------------------------------------------------------------------
+
+def test_spectrum_loss_is_zero_at_its_target():
+    rng = np.random.default_rng(73)
+    for shape in [(3, 3), (4, 4), (2, 2, 2)]:
+        I = rng.integers(1, 5, size=shape).astype(np.int64)
+        scale = ROW_SUMS(I)
+        assert LOSS(I, AREA_SPECTRUM(I), scale) == 0.0, shape
+
+
+def test_spectrum_loss_ignores_unreachable_bins():
+    """scale[k] == 0 means the bin cannot move, so its target is meaningless."""
+    I = np.ones((4, 4), dtype=np.int64)
+    scale = ROW_SUMS(I)
+    natural = (4 - 1) * (4 - 1)
+    n = definition.spectrum_length(I)
+    reachable = AREA_SPECTRUM(I)
+    unreachable = list(reachable)
+    unreachable[natural + 1] = 10 ** 6
+    assert LOSS(I, unreachable, scale) == LOSS(I, reachable, scale)
+
+
+def test_spectrum_loss_equals_squared_normalized_residual():
+    rng = np.random.default_rng(79)
+    I = rng.integers(1, 5, size=(3, 3)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(rng.integers(1, 5, size=(3, 3)).astype(np.int64))
+    expected = sum(
+        ((a - t) / s) ** 2 for a, t, s in zip(AREA_SPECTRUM(I), target, scale) if s > 0
+    )
+    assert math.isclose(LOSS(I, target, scale), expected, rel_tol=1e-12)
+
+
+def test_spectrum_gradient_matches_finite_difference():
+    """Central differences of the float relaxation, in 2d and 3d."""
+    rng = np.random.default_rng(83)
+    for shape in [(3, 3), (2, 2, 2)]:
+        I = rng.integers(1, 5, size=shape).astype(np.int64)
+        scale = ROW_SUMS(I)
+        target = [float(x) for x in rng.integers(0, 40000, size=len(scale))]
+        grad = SPEC_GRADIENT(I, target, scale)
+        h = 1e-5
+        for i, p in enumerate(np.ndindex(shape)):
+            up = I.astype(float)
+            up[p] += h
+            down = I.astype(float)
+            down[p] -= h
+            fd = (
+                _normalized_loss(up, scale, target)
+                - _normalized_loss(down, scale, target)
+            ) / (2 * h)
+            assert math.isclose(fd, grad[i], rel_tol=1e-6, abs_tol=1e-6), (shape, p, fd, grad[i])
+
+
+def test_spectrum_gradient_reduces_to_normalized_spectrum_gradient():
+    """The two are the same function on a target of the delta form.
+
+    normalized_spectrum_gradient exists only for target = A + delta*scale, where
+    the residual is pinned to -delta. With a general target the weight is
+    2*(A - target)/scale**2 instead.
+    """
+    rng = np.random.default_rng(89)
+    for shape in [(3, 3), (2, 2, 2)]:
+        I = rng.integers(1, 5, size=shape).astype(np.int64)
+        scale = ROW_SUMS(I)
+        A = AREA_SPECTRUM(I)
+        delta = [float(x) for x in rng.normal(size=len(A))]
+        target = [a + d * s for a, d, s in zip(A, delta, scale)]
+        general = SPEC_GRADIENT(I, target, scale)
+        special = GRADIENT(I, delta)
+        for a, b in zip(general, special):
+            assert math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9), (shape, a, b)
+
+
+def test_spectrum_gradient_on_zero_image_is_zero():
+    I = np.zeros((3, 3), dtype=np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(np.ones((3, 3), dtype=np.int64))
+    assert SPEC_GRADIENT(I, target, scale) == [0.0] * I.size
+
+
+# ---------------------------------------------------------------------------
+# integer_gradient_direction
+# ---------------------------------------------------------------------------
+
+def test_direction_is_ranked_by_effect_on_the_spectrum():
+    """The head is at worst a shade off the best step.
+
+    The spectrum is trilinear, so the gradient gives a step's effect on it
+    exactly. The loss is quadratic in the spectrum, so ranking by residual
+    change and ranking by loss drop can disagree; when they do the head is
+    still within a few percent. It is not guaranteed to improve at all, so
+    descent measures candidates rather than trusting the order.
+    """
+    rng = np.random.default_rng(97)
+    for shape in [(3, 3), (4, 4)]:
+        for _ in range(3):
+            I = rng.integers(0, 4, size=shape).astype(np.int64)
+            scale = ROW_SUMS(I)
+            target = AREA_SPECTRUM(rng.integers(0, 4, size=shape).astype(np.int64))
+            ranked = definition.ranked_gradient_steps(I, target, scale)
+            if len(ranked) < 4:
+                continue
+            base = LOSS(I, target, scale)
+
+            def decrease(pixel, step):
+                trial = I.copy()
+                trial[pixel] += step
+                return base - LOSS(trial, target, scale)
+
+            best = max(decrease(*m) for m in ranked)
+            head = decrease(*ranked[0])
+            assert head >= 0.9 * best, (shape, head, best)
+
+
+def test_head_is_almost_always_the_best_step():
+    """Trilinearity makes the gradient's head the best step nearly always.
+
+    The gradient is the exact change in the residual and the loss is quadratic
+    in the spectrum, so the head is exactly best whenever ranking by residual
+    change agrees with ranking by loss drop. Measured over many cases it
+    agrees the large majority of the time; the rare disagreement is small.
+    What is *not* safe is trusting it: the head can come out a net increase
+    when the best step only gains a little, which is why descent measures each
+    candidate against the loss rather than accepting the head.
+    """
+    rng = np.random.default_rng(0)
+    exact = 0
+    total = 0
+    for shape in [(3, 3), (4, 4), (5, 4)]:
+        for _ in range(20):
+            I = rng.integers(0, 4, size=shape).astype(np.int64)
+            scale = ROW_SUMS(I)
+            target = AREA_SPECTRUM(rng.integers(0, 4, size=shape).astype(np.int64))
+            ranked = definition.ranked_gradient_steps(I, target, scale)
+            if len(ranked) < 4:
+                continue
+            base = LOSS(I, target, scale)
+
+            def decrease(pixel, step):
+                trial = I.copy()
+                trial[pixel] += step
+                return base - LOSS(trial, target, scale)
+
+            best = max(decrease(*m) for m in ranked)
+            if best <= 0:
+                continue
+            head = decrease(*ranked[0])
+            total += 1
+            exact += math.isclose(head, best, rel_tol=1e-9)
+    assert total >= 40, total
+    # agreeing the large majority of the time, and never wildly off
+    assert exact > 0.75 * total, (exact, total)
+
+
+def test_direction_step_respects_bounds():
+    """A pixel already at a bound must be stepped inward or not at all."""
+    # 255 is not fully pinned, so it can step down; 0 is, and a target wanting
+    # more light than a black image can give leaves nothing feasible at all.
+    for value, has_move in ((0, False), (255, True)):
+        I = np.full((3, 3), value, dtype=np.int64)
+        scale = ROW_SUMS(I)
+        target = AREA_SPECTRUM(np.full((3, 3), 255 - value, dtype=np.int64))
+        proposal = DIRECTION(I, target, scale)
+        assert (proposal is not None) is has_move, value
+        if proposal is None:
+            continue
+        pixel, step = proposal
+        assert 0 <= int(I[pixel]) + step <= 255, (value, pixel, step)
+
+
+def test_direction_is_none_when_saturated():
+    """Every pixel pinned at 0 with a target that wants less gives no move."""
+    I = np.zeros((3, 3), dtype=np.int64)
+    scale = ROW_SUMS(I)
+    assert DIRECTION(I, AREA_SPECTRUM(np.zeros((3, 3), dtype=np.int64)), scale) is None
+
+
+def test_direction_is_none_at_its_target():
+    rng = np.random.default_rng(101)
+    I = rng.integers(1, 5, size=(3, 3)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    assert DIRECTION(I, AREA_SPECTRUM(I), scale) is None
+
+
+def test_direction_is_a_unit_step():
+    rng = np.random.default_rng(103)
+    for shape in [(3, 3), (4, 4)]:
+        I = rng.integers(1, 5, size=shape).astype(np.int64)
+        scale = ROW_SUMS(I)
+        target = AREA_SPECTRUM(rng.integers(0, 5, size=shape).astype(np.int64))
+        pixel, step = DIRECTION(I, target, scale)
+        assert step in (-1, 1)
+        assert I[pixel] + step != I[pixel]
+
+
+# ---------------------------------------------------------------------------
+# descent
+# ---------------------------------------------------------------------------
+
+def test_descent_is_monotone_and_improving():
+    rng = np.random.default_rng(107)
+    for shape in [(3, 3), (4, 4)]:
+        I = rng.integers(0, 6, size=shape).astype(np.int64)
+        scale = ROW_SUMS(I)
+        target = AREA_SPECTRUM(rng.integers(0, 6, size=shape).astype(np.int64))
+        r = DESCENT(I, target, scale, max_steps=300, patience=25)
+        assert all(b <= a for a, b in zip(r.history, r.history[1:])), shape
+        assert r.loss <= r.history[0]
+        assert len(r.history) == r.accepted_steps + 1, shape
+
+
+def test_descent_recovers_a_single_pixel_edit():
+    """A +-1 edit is one gradient step away, so descent should find it.
+
+    Held to a unit edit deliberately. A larger edit is a longer path and can
+    sit in a basin the unit-step neighbourhood cannot leave: on the old
+    definition a +3 edit on a 4x4 was recoverable, and under the distinct
+    points spectrum it is not, at any width. That is the local-minimum
+    behaviour patience is meant to report, not a regression.
+    """
+    rng = np.random.default_rng(109)
+    I = rng.integers(1, 6, size=(4, 4)).astype(np.int64)
+    edited = I.copy()
+    edited[2, 1] += 1
+    r = DESCENT(I, AREA_SPECTRUM(edited), ROW_SUMS(I), max_steps=300, patience=25, width=8)
+    assert r.loss == 0.0
+    assert (r.image == edited).all()
+
+
+def test_descent_recovers_unit_edits_across_seeds():
+    """The same round trip, over enough seeds to catch a systematic failure."""
+    recovered = 0
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        I = rng.integers(1, 6, size=(4, 4)).astype(np.int64)
+        edited = I.copy()
+        edited[int(rng.integers(0, 4)), int(rng.integers(0, 4))] += 1
+        r = DESCENT(I, AREA_SPECTRUM(edited), ROW_SUMS(I), max_steps=200,
+                    patience=25, width=8)
+        recovered += r.loss == 0.0
+    assert recovered >= 18, recovered
+
+
+def test_descent_reports_a_local_minimum_it_cannot_escape():
+    """A larger edit can be unreachable; descent must say so, not claim success.
+
+    Guards the honesty of stopped_early: the target is attainable (its loss is
+    0) yet the unit-step neighbourhood of the stalled image has no improving
+    move, so the run must end above 0 and report the stall.
+    """
+    rng = np.random.default_rng(109)
+    I = rng.integers(0, 6, size=(4, 4)).astype(np.int64)
+    edited = I.copy()
+    edited[2, 1] += 3
+    target = AREA_SPECTRUM(edited)
+    scale = ROW_SUMS(I)
+    assert LOSS(edited, target, scale) == 0.0, "target must be attainable"
+    r = DESCENT(I, target, scale, max_steps=300, patience=25, width=8)
+    assert r.loss > 0.0
+    assert r.stopped_early
+
+
+def test_descent_respects_bounds():
+    """Pinned pixels must not be pushed past the clamp, even under pressure."""
+    for value in (0, 255):
+        I = np.full((3, 3), value, dtype=np.int64)
+        scale = ROW_SUMS(I)
+        target = AREA_SPECTRUM(np.full((3, 3), 255 - value, dtype=np.int64))
+        r = DESCENT(I, target, scale, max_steps=200, patience=25)
+        assert r.image.min() >= 0, value
+        assert r.image.max() <= 255, value
+
+
+def test_descent_honours_explicit_bounds():
+    I = np.full((3, 3), 10, dtype=np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(np.full((3, 3), 4, dtype=np.int64))
+    r = DESCENT(I, target, scale, max_steps=200, patience=25, min_value=0, max_value=12)
+    assert r.image.max() <= 12
+    assert r.image.min() >= 0
+
+
+def test_descent_does_nothing_at_target():
+    rng = np.random.default_rng(113)
+    I = rng.integers(1, 5, size=(3, 3)).astype(np.int64)
+    r = DESCENT(I, AREA_SPECTRUM(I), ROW_SUMS(I), max_steps=50)
+    assert r.accepted_steps == 0
+    assert r.loss == 0.0
+    assert (r.image == I).all()
+    assert r.history == [0.0]
+
+
+def test_descent_respects_max_steps():
+    rng = np.random.default_rng(127)
+    I = rng.integers(0, 6, size=(4, 4)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(rng.integers(0, 6, size=(4, 4)).astype(np.int64))
+    r = DESCENT(I, target, scale, max_steps=3, patience=10 ** 6)
+    assert r.accepted_steps <= 3
+    assert len(r.history) == r.accepted_steps + 1
+
+
+def test_descent_reports_early_stop():
+    """stopped_early distinguishes a local minimum from a completed run."""
+    rng = np.random.default_rng(131)
+    I = rng.integers(0, 6, size=(3, 3)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(rng.integers(0, 6, size=(3, 3)).astype(np.int64))
+    tight = DESCENT(I, target, scale, max_steps=1000, patience=1)
+    assert tight.stopped_early
+
+
+def test_descent_preserves_shape_and_dtype():
+    rng = np.random.default_rng(137)
+    I = rng.integers(0, 6, size=(3, 3, 2)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(rng.integers(0, 6, size=(3, 3, 2)).astype(np.int64))
+    r = DESCENT(I, target, scale, max_steps=50, patience=10)
+    assert r.image.shape == I.shape
+    assert r.image.dtype == np.int64
+
+
+def test_descent_does_not_mutate_input():
+    rng = np.random.default_rng(139)
+    I = rng.integers(0, 6, size=(3, 3)).astype(np.int64)
+    before = I.copy()
+    DESCENT(I, AREA_SPECTRUM(np.ones((3, 3), dtype=np.int64)), ROW_SUMS(I), max_steps=20)
+    assert (I == before).all()
+
+
+def test_descent_default_scale_is_row_sums():
+    rng = np.random.default_rng(149)
+    I = rng.integers(0, 6, size=(3, 3)).astype(np.int64)
+    target = AREA_SPECTRUM(rng.integers(0, 6, size=(3, 3)).astype(np.int64))
+    assert DESCENT(I, target).image.tolist() == DESCENT(I, target, ROW_SUMS(I)).image.tolist()
