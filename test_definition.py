@@ -10,6 +10,7 @@ import definition
 VOLUME = definition.volume
 AREA_SPECTRUM = definition.area_spectrum
 ROW_SUMS = definition.jacobian_row_sums
+GRADIENT = definition.normalized_spectrum_gradient
 
 
 # ---------------------------------------------------------------------------
@@ -40,13 +41,29 @@ def _reference_row_sums(I):
 
 
 def _spectrum_float(I):
-    """Area spectrum over float pixel values, for finite differencing."""
+    """Area spectrum over float pixel values, for finite differencing.
+
+    area_spectrum casts with int(), which makes it a step function, so its
+    finite differences vanish. This is the polynomial relaxation the gradient
+    is actually the derivative of.
+    """
     coords = list(np.ndindex(I.shape))
     d = len(I.shape)
-    result = [0.0] * I.size
+    result = [0.0] * definition.spectrum_length(I)
     for S in itertools.product(coords, repeat=d + 1):
         result[VOLUME(S)] += math.prod(float(I[v]) for v in S)
     return result
+
+
+def _normalized_loss(I, scale, target):
+    """The objective normalized_spectrum_gradient descends, defined independently.
+
+    Written against the float spectrum so it can be finite differenced.
+    """
+    A = _spectrum_float(I)
+    return sum(
+        ((a - t) / s) ** 2 for a, t, s in zip(A, target, scale) if s > 0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -376,3 +393,200 @@ def test_all_one_image_has_no_dead_bins_below_support():
         assert all(x > 0 for x in A[:natural + 1]), shape
         R = ROW_SUMS(np.ones(shape, dtype=np.uint8))
         assert all(x > 0 for x in R[:natural + 1]), shape
+
+
+# ---------------------------------------------------------------------------
+# jacobian_transpose
+# ---------------------------------------------------------------------------
+
+def test_jacobian_transpose_sums_to_dot_with_row_sums():
+    """The two orientations meet at the total: sum_p (J^T w)[p] = sum_k w[k] S[k]."""
+    rng = np.random.default_rng(41)
+    for shape in [(2, 2), (3, 3), (3, 2), (2, 2, 2)]:
+        I = rng.integers(0, 4, size=shape).astype(np.int64)
+        w = [float(x) for x in rng.integers(-4, 5, size=definition.spectrum_length(I))]
+        got = definition.jacobian_transpose(I, w)
+        assert math.isclose(sum(got), sum(a * b for a, b in zip(w, ROW_SUMS(I))))
+
+
+def test_jacobian_transpose_matches_reference():
+    """result[p] = sum_k J[k][p] w[k], checked against the reference rows."""
+    rng = np.random.default_rng(43)
+    for shape in [(2, 2), (3, 3), (3, 2), (2, 2, 2)]:
+        I = rng.integers(0, 4, size=shape).astype(np.int64)
+        rows = _reference_rows(I)
+        w = [float(x) for x in rng.integers(-4, 5, size=len(rows))]
+        got = definition.jacobian_transpose(I, w)
+        for i, p in enumerate(np.ndindex(shape)):
+            expected = sum(row.get(p, 0) * wk for row, wk in zip(rows, w))
+            assert math.isclose(got[i], expected, rel_tol=1e-12, abs_tol=1e-9), (
+                shape, p, got[i], expected,
+            )
+
+
+def test_jacobian_transpose_stays_exact_for_integral_weights():
+    """Integer weights must not pass through a float, or huge rows lose precision."""
+    I = np.full((6, 6), 4, dtype=np.int64)
+    result = definition.jacobian_transpose(I, [3] * definition.spectrum_length(I))
+    assert all(isinstance(x, int) for x in result), [type(x) for x in result]
+    plain = definition.jacobian_transpose(I, [1] * definition.spectrum_length(I))
+    assert all(x == 3 * y for x, y in zip(result, plain))
+
+
+def test_jacobian_transpose_length():
+    for shape in [(2, 2), (3, 3), (4, 4), (2, 2, 2)]:
+        I = np.ones(shape, dtype=np.int64)
+        got = definition.jacobian_transpose(I, [1] * definition.spectrum_length(I))
+        assert len(got) == I.size
+
+
+# ---------------------------------------------------------------------------
+# normalized_spectrum_gradient
+# ---------------------------------------------------------------------------
+
+def _random_delta(rng, I, seed):
+    return [float(x) for x in rng.normal(size=definition.spectrum_length(I))]
+
+
+def test_gradient_matches_finite_difference():
+    """Central differences of the float objective, in 2d and 3d.
+
+    Differencing area_spectrum itself would be meaningless: its int() cast
+    makes it a step function whose differences under a 1e-5 step vanish.
+    """
+    rng = np.random.default_rng(47)
+    for shape in [(3, 3), (4, 3), (2, 2, 2)]:
+        I = rng.integers(1, 5, size=shape).astype(np.int64)
+        scale = ROW_SUMS(I)
+        A = _spectrum_float(I)
+        delta = _random_delta(rng, I, 47)
+        target = [a + d * s for a, d, s in zip(A, delta, scale)]
+        grad = GRADIENT(I, delta)
+        h = 1e-5
+        for i, p in enumerate(np.ndindex(shape)):
+            up = I.astype(float)
+            up[p] += h
+            down = I.astype(float)
+            down[p] -= h
+            fd = (
+                _normalized_loss(up, scale, target)
+                - _normalized_loss(down, scale, target)
+            ) / (2 * h)
+            assert math.isclose(fd, grad[i], rel_tol=1e-6, abs_tol=1e-6), (
+                shape, p, fd, grad[i],
+            )
+
+
+def test_gradient_is_zero_for_zero_delta():
+    rng = np.random.default_rng(53)
+    for shape in [(3, 3), (4, 4), (2, 2, 2)]:
+        I = rng.integers(1, 5, size=shape).astype(np.int64)
+        n = definition.spectrum_length(I)
+        assert GRADIENT(I, [0.0] * n) == [0.0] * I.size
+        assert GRADIENT(I, {}) == [0.0] * I.size
+
+
+def test_gradient_on_zero_image_is_zero_not_nan():
+    """Every bin has scale 0 here, so the naive division is 0/0."""
+    for shape in [(3, 3), (4, 4), (2, 2, 2)]:
+        I = np.zeros(shape, dtype=np.int64)
+        n = definition.spectrum_length(I)
+        assert ROW_SUMS(I) == [0] * n
+        grad = GRADIENT(I, [1.0] * n)
+        assert all(x == 0.0 for x in grad), shape
+        assert not any(math.isnan(x) for x in grad), shape
+
+
+def test_gradient_ignores_dead_bins():
+    """Bins above the natural support are unreachable, so edits there do nothing."""
+    I = np.ones((4, 4), dtype=np.int64)
+    natural = (4 - 1) * (4 - 1)
+    for k in range(natural + 1, definition.spectrum_length(I)):
+        assert ROW_SUMS(I)[k] == 0
+        assert GRADIENT(I, {k: 5.0}) == [0.0] * I.size
+
+
+def test_gradient_dead_bin_edits_do_not_disturb_live_bins():
+    I = np.ones((4, 4), dtype=np.int64)
+    natural = (4 - 1) * (4 - 1)
+    delta = {k: 1.0 for k in range(natural + 1)}
+    mixed = dict(delta)
+    mixed[definition.spectrum_length(I) - 1] = 100.0
+    assert GRADIENT(I, mixed) == GRADIENT(I, delta)
+
+
+def test_gradient_length_matches_image():
+    for shape in [(2, 2), (3, 3), (4, 4), (2, 2, 2)]:
+        I = np.ones(shape, dtype=np.int64)
+        n = definition.spectrum_length(I)
+        assert len(GRADIENT(I, [1.0] * n)) == I.size
+
+
+def test_gradient_scale_invariant():
+    """J has degree d, scale has degree d, so the 1/scale weight cancels it.
+
+    This is the whole point of normalizing by the row sums: the direction
+    should not depend on how bright the image is.
+    """
+    rng = np.random.default_rng(59)
+    for shape in [(3, 3), (4, 4), (2, 2, 2)]:
+        I = rng.integers(1, 5, size=shape).astype(np.int64)
+        delta = _random_delta(rng, I, 59)
+        base = GRADIENT(I, delta)
+        for c in (2, 5):
+            scaled = GRADIENT(c * I, delta)
+            for a, b in zip(base, scaled):
+                assert math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9), (shape, c, a, b)
+
+
+def test_gradient_rejects_out_of_range_bin():
+    I = np.ones((3, 3), dtype=np.int64)
+    with pytest.raises(IndexError):
+        GRADIENT(I, {definition.spectrum_length(I): 1.0})
+    with pytest.raises(IndexError):
+        GRADIENT(I, [(-1, 1.0)])
+
+
+def test_gradient_sparse_forms_agree():
+    rng = np.random.default_rng(61)
+    I = rng.integers(1, 5, size=(3, 3)).astype(np.int64)
+    n = definition.spectrum_length(I)
+    delta = _random_delta(rng, I, 61)
+    full = GRADIENT(I, delta)
+    assert GRADIENT(I, {k: v for k, v in enumerate(delta) if v}) == full
+    assert GRADIENT(I, list(enumerate(delta))) == full
+
+
+def test_gradient_descent_decreases_loss():
+    """Stepping against the gradient must lower the objective."""
+    rng = np.random.default_rng(67)
+    for shape in [(3, 3), (4, 4)]:
+        I = rng.integers(1, 5, size=shape).astype(np.int64)
+        scale = ROW_SUMS(I)
+        A = _spectrum_float(I)
+        delta = _random_delta(rng, I, 67)
+        target = [a + d * s for a, d, s in zip(A, delta, scale)]
+        grad = GRADIENT(I, delta)
+        step = 0.01 / max(abs(g) for g in grad)
+        assert _normalized_loss(I.astype(float), scale, target) > _normalized_loss(
+            I.astype(float) - step * np.array(grad).reshape(shape), scale, target
+        )
+
+
+def test_gradient_matches_reference_jacobian():
+    """Independent check: grad = -2 * J^T (delta / scale)."""
+    rng = np.random.default_rng(71)
+    for shape in [(3, 3), (3, 2), (2, 2, 2)]:
+        I = rng.integers(1, 5, size=shape).astype(np.int64)
+        scale = ROW_SUMS(I)
+        delta = _random_delta(rng, I, 71)
+        rows = _reference_rows(I)
+        expected = [
+            -2.0 * sum(
+                row.get(p, 0) * d / s for row, d, s in zip(rows, delta, scale) if s > 0
+            )
+            for p in np.ndindex(shape)
+        ]
+        got = GRADIENT(I, delta)
+        for a, b in zip(got, expected):
+            assert math.isclose(a, b, rel_tol=1e-12, abs_tol=1e-9), (shape, a, b)
