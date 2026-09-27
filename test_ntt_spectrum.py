@@ -8,6 +8,7 @@ and the per-axis padding floor. Each of those returns an array of the right
 shape with plausible values, or a spectrum that is right everywhere except the
 degenerate cases, so only a comparison against the reference catches them.
 """
+import itertools
 import math
 from collections import Counter
 
@@ -21,6 +22,7 @@ from definition import area_spectrum, spectrum_length
 from ntt_spectrum import (
     NTTBackend,
     UnsupportedDimension,
+    _half_offsets,
     _masked_copy,
     _offsets,
     _primes_of_order_2,
@@ -509,6 +511,223 @@ def test_spectrum_mod_is_a_residue_not_the_count():
     assert np.array_equal(
         spectrum_mod(I, P, ROOT), np.array(area_spectrum(I)) % P
     )
+
+
+# ---------------------------------------------------------------------------
+# the halved offset loop
+# ---------------------------------------------------------------------------
+
+def _ordered_triple_oracle(I):
+    """The spectrum by walking ordered triples, with no offsets involved.
+
+    Independent of everything ntt_spectrum does: no padding, no flat shift, no
+    correlation, no bin formula. Slow, so only for small images, but it is the
+    statement of what the loop is supposed to compute, and the other tests in
+    this file all reach the same quantity *through* those steps.
+    """
+    n = spectrum_length(I)
+    H, W = I.shape
+    out = np.zeros(n, dtype=np.int64)
+    for a, b, c in itertools.permutations(
+        [(y, x) for y in range(H) for x in range(W)], 3
+    ):
+        k = abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+        if k < n:
+            out[k] += int(I[a]) * int(I[b]) * int(I[c])
+    return out
+
+
+@pytest.mark.parametrize("shape", [
+    (2, 2), (2, 3), (3, 2), (3, 3), (3, 4), (4, 3), (4, 4), (2, 7), (7, 2),
+    (5, 5), (4, 6), (6, 4),
+])
+def test_spectrum_mod_equals_an_independent_ordered_triple_sum(shape):
+    rng = np.random.default_rng(31)
+    for hi in (2, 3, 7):
+        I = rng.integers(0, hi, size=shape).astype(np.int64)
+        assert np.array_equal(
+            spectrum_mod(I, P, ROOT), _ordered_triple_oracle(I)
+        ), (shape, hi)
+
+
+@pytest.mark.parametrize("I", [
+    np.zeros((3, 3), dtype=np.int64),            # no triangle at all
+    np.ones((4, 4), dtype=np.int64),             # every triangle, all equal
+    np.eye(5, dtype=np.int64),                   # every bin forced at once
+    (np.arange(16).reshape(4, 4) % 2).astype(np.int64),
+    np.full((3, 3), 5, dtype=np.int64),
+])
+def test_spectrum_mod_on_degenerate_images(I):
+    """Zeros, all-ones, the identity: the cases a symmetry argument can break.
+
+    Bin 0 in particular carries the collinear-but-distinct triangles, which the
+    relabelling treats no differently from the rest, so a halving that is right
+    in general can still be wrong there.
+    """
+    assert np.array_equal(spectrum_mod(I, P, ROOT), _ordered_triple_oracle(I))
+    assert np.array_equal(spectrum_mod(I, P, ROOT), np.array(area_spectrum(I)))
+
+
+@pytest.mark.parametrize("shape", [
+    (2, 2), (3, 3), (4, 4), (2, 5), (5, 2), (3, 4), (4, 3), (6, 4), (7, 5),
+    (8, 8), (2, 16), (16, 2),
+])
+def test_half_offsets_takes_exactly_one_of_d_and_minus_d(shape):
+    """The transversal property the factor of 2 rests on.
+
+    Any set with this property would do -- the weights are flat, so which member
+    of each pair survives is irrelevant. Checking it directly is what pins the
+    halving to a real symmetry rather than to a coincidence of the shapes
+    tested above.
+    """
+    pad = pad_shape(np.zeros(shape, dtype=np.int64))
+    dy, dx, valid = _offsets(pad, shape)
+    half = _half_offsets(dy, dx, valid)
+    rows, cols = pad
+    for y, x in zip(dy, dx):
+        s = (y * cols + x) % (rows * cols)
+        if not valid[s] or s == 0:
+            continue
+        neg = (-y * cols - x) % (rows * cols)
+        assert bool(half[s]) != bool(half[neg]), (shape, int(y), int(x))
+    # exactly half, less the zero offset that neither half contains
+    assert int(half.sum()) == (int(valid.sum()) - 1) // 2, shape
+
+
+@pytest.mark.parametrize("shape", [
+    (2, 2), (3, 3), (4, 4), (2, 5), (5, 2), (3, 4), (6, 4), (7, 5), (8, 8),
+])
+def test_spectrum_mod_equals_the_full_loop_with_one_weight(shape):
+    """The halved loop, re-expanded by hand, against a loop over every offset.
+
+    spectrum_mod now runs over half the offsets and multiplies by 2, which is
+    only equal to the plain loop if the relabelling argument is right. This
+    states the equality directly instead of resting on it, so a wrong factor
+    (1, 3, 4) or a half that is not a transversal is caught as itself rather
+    than only as a mismatch against definition.py.
+    """
+    rng = np.random.default_rng(32)
+    I = rng.integers(0, 5, size=shape).astype(np.int64)
+    pad = pad_shape(I)
+    rows, cols = pad
+    N = rows * cols
+    n = spectrum_length(I)
+    dy, dx, valid = _offsets(pad, I.shape)
+    Ihat = ntt(embed(I, pad), P, ROOT)
+
+    def loop(offsets, weight=1):
+        A = np.zeros(n, dtype=np.int64)
+        for s2 in offsets:
+            s2 = int(s2)
+            if s2 == 0:
+                continue
+            b2y, b2x = int(dy[s2]), int(dx[s2])
+            bins = np.abs(dy * b2x - dx * b2y)
+            keep = valid & (bins < n) & (np.arange(N) != s2)
+            keep[0] = False
+            T = triple_correlation(I, (b2y, b2x), pad, P, ROOT, Ihat)
+            np.add.at(A, bins[keep], weight * T[keep])
+            A %= P
+        return A
+
+    full = loop(np.nonzero(valid)[0])
+    half_raw = loop(np.nonzero(_half_offsets(dy, dx, valid))[0])
+    # the halved loop reproduces the full one only with the factor of 2 ...
+    assert np.array_equal(spectrum_mod(I, P, ROOT, pad), full), shape
+    assert np.array_equal(2 * half_raw % P, full), shape
+    # ... and the factor is load-bearing rather than accidentally right, so a
+    # dropped "2 *" or a doubled one is caught here as itself
+    assert not np.array_equal(half_raw % P, full), shape
+
+
+def test_the_relabelling_identity_the_halving_needs():
+    """T(d1,d2) = T(d1-d2,-d2), the step that makes the weights flat.
+
+    Re-anchoring a triangle at a different one of its three pixels has to leave
+    the section alone, and that is what lets one flat factor cover all six
+    relabellings. It is also what makes the orbits with fewer than six members
+    harmless: if d1-d2 is out of range the right-hand side is a section at an
+    out-of-range offset, and every such section is zero.
+
+    Checked as a whole section rather than entry by entry, so it is the identity
+    being pinned and not one offset pair that happens to agree.
+    """
+    rng = np.random.default_rng(33)
+    I = rng.integers(1, 6, size=(5, 5)).astype(np.int64)
+    pad = pad_shape(I)
+    rows, cols = pad
+    N = rows * cols
+    dy, dx, valid = _offsets(pad, I.shape)
+    idx = np.nonzero(valid)[0]
+    for d2y, d2x in [(0, 1), (1, 0), (2, 1), (-1, 2), (0, -2), (2, -2)]:
+        lhs = triple_correlation(I, (d2y, d2x), pad, P, ROOT)
+        rhs = triple_correlation(I, (-d2y, -d2x), pad, P, ROOT)
+        # the whole section: T(., d2) at every valid d1 against the
+        # re-anchoring T(., -d2) at d1-d2, entry by entry
+        s = (np.arange(N) - d2y * cols - d2x) % N
+        assert np.array_equal(lhs[idx], rhs[s[idx]]), (d2y, d2x)
+
+
+def test_the_row_sum_and_gradient_sections_are_not_relabelling_invariant():
+    """Why the halving stops at the spectrum, as a test rather than a claim.
+
+    The two neighbours share the loop shape but not the symmetry: the row-sum
+    section is a correlation against a *masked* copy, so it depends on d1 and
+    not on d2-d1 alone, and the gradient's on the difference alone. Both break
+    the identity above, which is exactly why their loops stay whole. If a
+    future change makes either of them invariant, this test fails and points at
+    the halving as newly available.
+    """
+    rng = np.random.default_rng(34)
+    I = rng.integers(1, 6, size=(5, 5)).astype(np.int64)
+    pad = pad_shape(I)
+    rows, cols = pad
+    N = rows * cols
+    neg = (-np.arange(N)) % N
+    Ihat = ntt(embed(I, pad), P, ROOT)
+    d1y, d1x, d2y, d2x = 1, 0, 0, 1
+    # the spectrum section, which is invariant
+    T = triple_correlation(I, (d2y, d2x), pad, P, ROOT, Ihat)
+    # the row-sum section at d1 and at the re-anchoring -d1
+    B = intt(ntt(_masked_copy(I, pad, d1y, d1x), P, ROOT)[neg] * Ihat % P,
+             P, ROOT)
+    B2 = intt(ntt(_masked_copy(I, pad, -d1y, -d1x), P, ROOT)[neg] * Ihat % P,
+              P, ROOT)
+    s1 = (d1y * cols + d1x) % N
+    s2 = ((d1y - d2y) * cols + (d1x - d2x)) % N
+    s2b = ((-d1y - d2y) * cols + (-d1x - d2x)) % N
+    # T(., d2) at d1 against T(., -d2) at d1-d2, the re-anchoring
+    T2 = triple_correlation(I, (-d2y, -d2x), pad, P, ROOT)
+    assert int(T[s1]) == int(T2[s2]), "spectrum section lost relabelling symmetry"
+    assert int(B[s2]) != int(B2[s2b]), \
+        "row-sum section became relabelling-invariant"
+
+
+def test_spectrum_mod_loops_over_half_as_many_offsets():
+    """The point of the change, measured rather than argued."""
+    import ntt_spectrum as ns
+
+    calls = []
+    real = ns.triple_correlation
+
+    def counting(I, d2, pad, p, root, Ihat=None):
+        calls.append(d2)
+        return real(I, d2, pad, p, root, Ihat)
+
+    for shape in [(4, 4), (6, 6), (3, 9)]:
+        calls.clear()
+        I = np.ones(shape, dtype=np.int64)
+        pad = pad_shape(I)
+        dy, dx, valid = _offsets(pad, shape)
+        ns.triple_correlation = counting
+        try:
+            spectrum_mod(I, P, ROOT, pad)
+        finally:
+            ns.triple_correlation = real
+        assert len(calls) == int(_half_offsets(dy, dx, valid).sum()), shape
+        assert len(calls) == (int(valid.sum()) - 1) // 2, shape
+        assert ns.spectrum_mod(I, P, ROOT, pad).tolist() == \
+            np.array(area_spectrum(I)).tolist(), shape
 
 
 # ---------------------------------------------------------------------------

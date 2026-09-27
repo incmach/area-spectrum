@@ -87,36 +87,83 @@ Accumulation is done with np.add.at on int64, not np.bincount: bincount
 accumulates in float64, and a bin of a 64x64 image can exceed 2**53, where
 float64 addition silently stops being exact.
 
+Halving the offset loop
+-----------------------
+A triangle is named once per way of naming its three points, and naming them
+differently leaves both the correlation and the bin alone: T is a product of
+the same three pixel values, and |det| is six times the same area whatever the
+order. So the six relabellings
+
+    (d1,d2)  (d2,d1)  (-d1,d2-d1)  (d1-d2,-d2)  (d2-d1,-d1)  (-d2,d1-d2)
+
+all carry the same value into the same bin, and each one's *second* offset is
+one of +-d1, +-d2, +-(d1-d2) -- one from each opposite pair. Any transversal of
+the opposite pairs therefore meets exactly three of the six, whatever the
+triangle, so a loop over such a half with a flat factor of 2 counts every
+triangle as often as a loop over all of them. That is half the transforms, and
+the weight is a constant rather than a clever per-triangle one because the case
+analysis collapses: the only orbits with fewer than six members are those with
+d1-d2 out of range, and those have a vanishing section, since
+T(d1,d2) = T(d1-d2,-d2) by re-anchoring and T is zero for an out-of-range
+offset.
+
+This is a property of the three-point correlation, not of the offset loop as
+such, and it does not extend to the two neighbours that share the loop shape.
+The row sums weight a *masked* copy, so their section depends on d1 as well as
+on d2-d1 -- the mask keeps only anchors that are themselves pixels with both
+partners in the image, and re-anchoring moves that condition -- and the
+gradient weights a two-point correlation, which sees only the difference
+d1-d2. Neither is invariant under relabelling, so neither loop can be halved;
+the swap symmetry alone is not enough, because a pair of offsets can sit
+entirely in one half. spectrum_mod below is the only one of the three where
+this applies.
+
 Where this actually wins
 ------------------------
 The reference is O(pixels**(d+1)) tuple enumerations; this is one
 length-My*Mx transform per offset, i.e. about (2W)(2H) transforms of length
-My*Mx, so O(pixels**2 log pixels) with a vectorised constant. Measured on this
-machine against definition.area_spectrum, exact and equal at every size:
+My*Mx, so O(pixels**2 log pixels) with a vectorised constant. The offset loop
+runs over half the offsets, so the transform count is about (W)(2H) and the
+measured gain is a flat 2x on this function. Against definition.area_spectrum,
+exact and equal at every size, with max_value=5 (three passes) on a 0..5 image:
 
-    4x4    pad  8x8     64    0.053s -> 0.015s    3.5x
-    8x8    pad 16x16   256    0.186s -> 0.131s    1.4x
-    12x12  pad 32x32  1024    2.195s -> 0.939s    2.3x
-    16x16  pad 32x32  1024   12.479s -> 1.743s    7.2x
-    6x10   pad 16x32   512    0.157s -> 0.137s    1.1x
-    4x20   pad  8x64   512    0.378s -> 0.272s    1.4x
+    4x4    pad  8x8     64    0.071s -> 0.011s    6.4x
+    8x8    pad 16x16   256    0.237s -> 0.082s    2.9x
+    12x12  pad 32x32  1024    2.897s -> 0.639s    4.5x
+    16x16  pad 32x32  1024   16.708s -> 1.165s   14.3x
+    6x10   pad 16x32   512    0.217s -> 0.137s    1.6x
+    4x20   pad  8x64   512    0.490s -> 0.193s    2.5x
 
-Two things to read off that. The search yields the *smallest* primes of the
-required 2-adic order -- 257, 769, 3329 for order 2**8 -- where the hand-written
-table it replaced started at 998244353. A short modulus makes each pass cheaper
-but forces more of them, since the product has to clear the same bound, and that
-is the whole of why these numbers are worse than the ones this module quoted
-before the search landed; the rectangle leaves a square's pad unchanged, so it
-costs nothing on the square rows. max_value=5 already limits the pass count to a
-handful; the dtype default for int64 is the worst case, and is the price of the
-value-independent bound.
+The value-independent bound is the price of the dtype default, and with it
+this method is *slower* than the reference over most of the range. The same
+four shapes with no max_value, so int64's range and 15-20 passes instead of 3:
 
-The non-square rows also show where the method does *not* win: 2x8 and 3x7 are
-slower than the reference, because a handful of pixels makes the reference's
-enumeration nearly free while this still pays for a full pass per prime. The
-crossover is around 8x8 by area and it is not about aspect ratio. This is a
-numpy implementation, so the absolute numbers are far off what a compiled
-implementation would give; the shape of the curve is the point, not the factor.
+    4x4    0.071s -> 0.066s    1.1x        8x8   0.237s -> 0.511s   0.5x
+    12x12  2.897s -> 3.188s    0.9x       16x16 16.708s -> 5.766s   2.9x
+
+Halving roughly doubles each of those ratios, since the loop is the whole of the
+pass and the reference is unaffected by it. Before the change the same
+measurement was 0.134s, 0.996s, 6.353s and 11.934s -- 0.5x, 0.2x, 0.5x and 1.4x
+-- so 4x4 and 16x16 now beat the reference and 8x8 and 12x12 still do not. The
+dtype-default crossover moves from 16x16 down to 4x4 and the max_value=5
+crossover from 8x8 to 4x4. Pass max_value when the caller knows the range, and
+the numbers in the first table are the ones to plan against.
+
+Two things to read off the first table. The search yields the *smallest* primes
+of the required 2-adic order -- 257, 769, 3329 for order 2**8 -- where the
+hand-written table it replaced started at 998244353. A short modulus makes each
+pass cheaper but forces more of them, since the product has to clear the same
+bound, and that is the whole of why these numbers are worse than the ones this
+module quoted before the search landed; the rectangle leaves a square's pad
+unchanged, so it costs nothing on the square rows.
+
+The non-square rows show the same effect from the other side: 6x10 and 4x20 sit
+near the crossover because a handful of pixels makes the reference's
+enumeration nearly free while this still pays for a full pass per prime, and
+their long axis does not stop the rectangle from saving the padding. The
+crossover is about area, not aspect ratio. This is a numpy implementation, so
+the absolute numbers are far off what a compiled implementation would give; the
+shape of the curve is the point, not the factor.
 """
 import functools
 import math
@@ -397,6 +444,23 @@ def _offsets(pad, shape):
     return dy, dx, valid
 
 
+def _half_offsets(dy, dx, valid):
+    """One offset from each opposite pair (d, -d): a half for the d2 loop.
+
+    The halving itself is a symmetry of the three-point correlation rather than
+    of the offsets, and is argued in the module docstring; what this picks is
+    just a set of representatives. dy > 0 with the dy == 0 tie broken by
+    dx > 0 takes exactly one of d and -d for every nonzero offset, so the count
+    is (valid.sum() - 1) // 2, the one being the zero offset that both halves
+    leave out.
+
+    Any such transversal works -- the weights are flat, so which member of each
+    pair survives is irrelevant. This one is the cheapest to state: it needs
+    only the coordinate arrays already in hand and no extra index arithmetic.
+    """
+    return valid & ((dy > 0) | ((dy == 0) & (dx > 0)))
+
+
 def triple_correlation(I, d2, pad, p, root, Ihat=None):
     """One section T(., d2) of the three-point correlation, mod p.
 
@@ -435,6 +499,12 @@ def spectrum_mod(I, p, root, pad=None):
     forgetting it. The full section is ((2H-1)(2W-1))^2 entries -- for a 32x32
     image about 2.8 million, and for 64x64 about 2.5 * 10**8 -- and its sum by
     volume is all the spectrum needs, so materialising it would buy nothing.
+
+    The loop runs over half the offsets and carries a factor of 2 to match; see
+    the module docstring. A section's second offset has to be one specific
+    member of its opposite pair for the count to be right, which is why the
+    factor is applied once at the end rather than folded into the per-iteration
+    factor or into the section itself.
     """
     H, W = I.shape
     if pad is None:
@@ -445,10 +515,8 @@ def spectrum_mod(I, p, root, pad=None):
     dy, dx, valid = _offsets(pad, I.shape)
     A = np.zeros(n_spectrum, dtype=np.int64)
     Ihat = ntt(embed(I, pad), p, root)
-    for s2 in np.nonzero(valid)[0]:
+    for s2 in np.nonzero(_half_offsets(dy, dx, valid))[0]:
         s2 = int(s2)
-        if s2 == 0:
-            continue                       # d1 == d2 would repeat a point
         b2y, b2x = int(dy[s2]), int(dx[s2])
         # bin for every d1, and the pairs that keep the three points distinct
         bins = np.abs(dy * b2x - dx * b2y)
@@ -457,7 +525,10 @@ def spectrum_mod(I, p, root, pad=None):
         T = triple_correlation(I, (b2y, b2x), pad, p, root, Ihat)
         np.add.at(A, bins[keep], T[keep])
         A %= p
-    return A
+    # s2 == 0 is not in the half, so the zero offset needs no test above, and
+    # neither does d1 == d2: relabelling never turns a distinct pair into a
+    # repeated point, so the exclusion is uniform across an orbit.
+    return 2 * A % p
 
 
 def _masked_copy(I, pad, dy, dx):
@@ -506,6 +577,12 @@ def row_sums_mod(I, p, root, pad=None):
     counted -- so multiplying once at the end is right, and multiplying per
     iteration would be wrong. The same 3 belongs to the gradient, for the
     unrelated reason that a triple moves all three of its pixels.
+
+    The loop is over *all* the offsets, unlike spectrum_mod's half. The halving
+    there is a symmetry of the three-point correlation, and the section here is
+    not that: the mask keeps only anchors that are themselves pixels with both
+    partners in the image, so B depends on d1 and not on d2-d1 alone, and
+    re-anchoring moves that condition rather than preserving it.
     """
     if pad is None:
         pad = pad_shape(I)
@@ -557,6 +634,14 @@ def spectrum_gradient_ntt(I, target, scale, pad=None, spectrum=None):
     O(p**2 log p) against the reference's O(p**3). The weights are floats, so
     this path uses numpy's float FFT rather than the NTT and returns a float
     vector; it is exact only up to rounding.
+
+    The loop is over *all* the offsets, unlike spectrum_mod's half. The halving
+    there needs a summand that relabelling the triangle leaves alone, and
+    w[|det|] times a two-point correlation does not have one: the correlation
+    sees only the difference d1-d2, so the three relabellings of a triangle that
+    share an outer offset in one half can carry three different values. The
+    swap alone is not enough either, since a pair of offsets can both land in
+    the same half and so be counted twice, or in the other and be missed.
 
     The weights need the spectrum of I, which costs another O(p**2 log p).
     spectrum passes one in for a caller that has just computed it; the default
