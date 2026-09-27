@@ -1,0 +1,520 @@
+"""Area spectrum by triple correlation, section extraction, and NTTs.
+
+The fast path contemplated by T0.1-02, written to be checked against the
+reference in definition.py rather than trusted.
+
+The identity
+------------
+For an image I on Z^d, the three-point correlation is
+
+    T(d1, d2) = sum_v I[v] I[v+d1] I[v+d2]
+
+and the area spectrum is its diagonal sum by volume,
+
+    A[k] = sum over offset pairs with |det| = k of T(d1, d2)
+
+taken over offsets whose d+1 points are distinct, exactly as definition.py
+requires. A nonzero determinant already forces affine independence and hence
+distinctness, so the restriction only ever removes pairs from bin 0.
+
+This is inherently a 2D method. A d-dimensional volume is the determinant of a
+d x d matrix built from d offsets, so a three-point correlation -- two offsets --
+determines the volume only when d = 2. For d >= 3 the same scheme needs a
+(d+1)-point correlation and a d-offset section, which costs one section per
+(d-1)-tuple of offsets rather than per offset; see the error in
+area_spectrum_ntt.
+
+Why padding, and why a power of two
+----------------------------------
+The correlation is cyclic, so it is computed on a torus. Zeros are padding, and
+a cyclic sum over a padded array equals the linear sum over the original, so
+the padding is what makes the cyclic answer the linear one. A radix-2 NTT needs
+a power-of-two length, and the 2D problem is turned into a single 1D transform
+by embedding I in the corner of a padded rectangle and flattening row-major, so
+a shift (dy, dx) is the flat shift dy*Mx + dx.
+
+The rectangle is sized per axis, not from the longest side, because the two
+axes have genuinely different requirements and forcing them equal wastes work on
+every non-square image. With a row stride Mx, two offsets collide only if
+(dy1-dy2)*Mx = dx2-dx1, and since |dx| <= W-1 that needs Mx > 2(W-1). The same
+bound comes from the borrow: when x + dx < 0 the flat index steps into the
+previous row, and the column it lands on, Mx-(W-1), must be past the image, so
+again Mx >= 2W-1. The row axis needs only My >= 2H-1 by the identical argument.
+Both are rounded up to powers of two, which also makes the flat length My*Mx a
+power of two as radix-2 requires.
+
+Padding from the longest side instead -- an M x M square with M from
+max(W, H) -- is correct but pays for the larger axis on both. On a 2x8 image the
+rectangle is 4x16 where the square is 16x16, a 4x saving in transform length,
+and it is the common case for photographic crops:
+
+    3x3   8x8    = 64   (square:  64)    0% saved
+    5x5  16x16   = 256   (square: 256)    0% saved
+    3x7   8x16   = 128   (square: 256)   50% saved
+    2x8   4x16   = 64   (square: 256)   75% saved
+
+The padding requirement is the whole of it: the bin index is an exact integer
+determinant of signed offsets and is never reduced mod p, so the modulus does
+not have to resolve volumes.
+
+Why several small primes and CRT
+--------------------------------
+Every value here is computed mod p, so a bin can come back as its residue
+rather than as a nonnegative count. Choosing p large enough to hold a bin would
+mean primes with thousands of bits, which no fast transform wants. Instead a
+few small primes are used whose product provably exceeds an upper bound on any
+bin, and the Chinese Remainder Theorem then reconstructs the exact integer. The
+result is exact, not a tolerance, and the bound is asserted rather than assumed.
+
+The primes are searched for rather than hardcoded, because the 2-adic exponent
+they need is a property of the padded transform length, hence of the image
+shape, and hardcoding a table would have to anticipate every shape. For a
+required order 2**n the search takes the smallest primes of the form
+k*2**n + 1, which is exactly the set with a root of unity of that order, and
+checks each with galois.is_prime. This is the same family as the familiar
+998244353 = 119*2**23 + 1, reached here by search rather than by memory.
+
+The bound is deliberately independent of the pixel values, so the prime set is
+a function of the shape and dtype alone. That makes it cacheable across images
+of the same type -- the point of caching it -- and it removes a sharp edge
+where an unusually bright image would silently need more primes than a dim one.
+The cost is that the bound is set by the dtype's maximum rather than the
+image's, so a dim image pays for a bright one's worst case. Using the dtype
+maximum is still vastly tighter than any single prime, since the bound grows
+only cubically in the value while the primes multiply.
+
+Accumulation is done with np.add.at on int64, not np.bincount: bincount
+accumulates in float64, and a bin of a 64x64 image can exceed 2**53, where
+float64 addition silently stops being exact.
+
+Where this actually wins
+------------------------
+The reference is O(pixels**(d+1)) tuple enumerations; this is one
+length-My*Mx transform per offset, i.e. about (2W)(2H) transforms of length
+My*Mx, so O(pixels**2 log pixels) with a vectorised constant. Measured on this
+machine against definition.area_spectrum, exact and equal at every size:
+
+    4x4    pad  8x8     64    0.053s -> 0.015s    3.5x
+    8x8    pad 16x16   256    0.186s -> 0.131s    1.4x
+    12x12  pad 32x32  1024    2.195s -> 0.939s    2.3x
+    16x16  pad 32x32  1024   12.479s -> 1.743s    7.2x
+    6x10   pad 16x32   512    0.157s -> 0.137s    1.1x
+    4x20   pad  8x64   512    0.378s -> 0.272s    1.4x
+
+Two things to read off that. The search yields the *smallest* primes of the
+required 2-adic order -- 257, 769, 3329 for order 2**8 -- where the hand-written
+table it replaced started at 998244353. A short modulus makes each pass cheaper
+but forces more of them, since the product has to clear the same bound, and that
+is the whole of why these numbers are worse than the ones this module quoted
+before the search landed; the rectangle leaves a square's pad unchanged, so it
+costs nothing on the square rows. max_value=5 already limits the pass count to a
+handful; the dtype default for int64 is the worst case, and is the price of the
+value-independent bound.
+
+The non-square rows also show where the method does *not* win: 2x8 and 3x7 are
+slower than the reference, because a handful of pixels makes the reference's
+enumeration nearly free while this still pays for a full pass per prime. The
+crossover is around 8x8 by area and it is not about aspect ratio. This is a
+numpy implementation, so the absolute numbers are far off what a compiled
+implementation would give; the shape of the curve is the point, not the factor.
+"""
+import functools
+import math
+
+import galois
+import numpy as np
+
+import definition
+
+
+def pad_shape(I):
+    """Padded (rows, cols) for I, each axis a power of two.
+
+    My >= 2H-1 and Mx >= 2W-1 are what the flat encoding requires: with a row
+    stride Mx, two offsets collide only if (dy1-dy2)*Mx = dx2-dx1, and
+    |dx| <= W-1 rules that out once Mx > 2(W-1). The same bound falls out of
+    the borrow, since a negative x lands on column Mx-(W-1) of the previous row
+    and that must be past the image. Rows need only My >= 2H-1 by the same
+    argument, so the axes are sized independently and a non-square image is not
+    charged for its longer side twice.
+
+    Both axes are floored at 2, which a degenerate axis would otherwise miss: a
+    1-row image would otherwise get rows == 1, and the centring test
+    dy >= rows//2 would then read 0 >= 0 and report a shift of 0 as -1. That
+    empties the valid set and silently zeroes bin 0.
+    """
+    H, W = I.shape
+    rows = 2
+    while rows < 2 * H - 1:
+        rows *= 2
+    cols = 2
+    while cols < 2 * W - 1:
+        cols *= 2
+    return rows, cols
+
+
+def pad_length(I):
+    """The flat transform length, My*Mx, a power of two."""
+    rows, cols = pad_shape(I)
+    return rows * cols
+
+
+def pad_length_of_shape(shape):
+    """pad_length for a bare shape, so the prime cache needs no array."""
+    rows, cols = 2, 2
+    while rows < 2 * shape[0] - 1:
+        rows *= 2
+    while cols < 2 * shape[1] - 1:
+        cols *= 2
+    return rows * cols
+
+
+@functools.lru_cache(maxsize=None)
+def _primes_of_order_2(exponent):
+    """The smallest primes p = k*2**exponent + 1, in increasing order.
+
+    Exactly the primes carrying a 2**exponent-th root of unity, which is what a
+    radix-2 transform of that length needs. A generator of the multiplicative
+    group raised to (p-1)/2**exponent gives the root, so no separate search for
+    a root is needed.
+
+    Searched rather than hardcoded because the exponent follows from the padded
+    length, hence from the image shape; a fixed table would have to anticipate
+    every shape. Cached per exponent since many shapes share one.
+    """
+    step = 1 << exponent
+    out = []
+    candidate = step + 1
+    while len(out) < 64:                     # far more than any image needs
+        prime = int(galois.next_prime(candidate - 1))
+        if (prime - 1) % step == 0:
+            out.append(prime)
+        # resume just past this prime, on the next 1 mod step
+        candidate = prime + 1
+        candidate += (step - candidate % step) % step
+    return tuple(out)
+
+
+def dtype_max(dtype):
+    """The largest value the dtype can hold, for a value-independent bound."""
+    dtype = np.dtype(dtype)
+    if dtype.kind == "b":
+        return 1
+    if dtype.kind in "iu":
+        return int(np.iinfo(dtype).max)
+    if dtype.kind == "f":
+        # a float image is scaled down to an integer grid first; 255 is the
+        # 8-bit working range, and the spectrum is only defined on integers
+        return 255
+    raise TypeError(f"no value bound known for dtype {dtype}")
+
+
+def bin_bound(I, max_value=None):
+    """A provable upper bound on any single bin, from the dtype not the values.
+
+    A bin sums T(d1, d2) over the offset pairs landing in it. T is nonzero only
+    for offsets that fit inside the image, so it has at most I.size terms, each
+    at most maxval**3; and there are at most (2H-1)*(2W-1)**2 offset pairs in
+    all. The product of the chosen primes must exceed this, or CRT reconstructs
+    a residue rather than the count.
+
+    Deliberately blind to the actual pixels: that is what lets the prime set be
+    cached per (shape, dtype), and it costs only that a dim image is charged for
+    a bright one's worst case. For int64 that is not free -- the dtype's range
+    is 2**63, so a 6x6 image wants 16 primes where uint8 wants 4, each one a
+    full pass over the sections. Pass max_value to charge for the range the
+    image actually uses when the caller knows it; the cache key includes it, so
+    the tightened set is cached just as well.
+    """
+    H, W = I.shape
+    if max_value is None:
+        max_value = dtype_max(I.dtype)
+    pairs = (2 * H - 1) * (2 * W - 1) ** 2
+    return pairs * I.size * max(int(max_value), 1) ** 3
+
+
+@functools.lru_cache(maxsize=None)
+def primes_for_shape(shape, dtype, bound):
+    """Smallest prefix of 2**n-friendly primes whose product exceeds bound.
+
+    Cached on (shape, dtype, bound). Shape fixes the transform length and so
+    the required 2-adic exponent; dtype and shape together fix the bound; the
+    bound fixes how many primes are needed. Two images of the same shape and
+    dtype therefore share one prime set and one search.
+    """
+    n = pad_length_of_shape(shape)
+    exponent = n.bit_length() - 1
+    available = _primes_of_order_2(exponent)
+    chosen = []
+    product = 1
+    for p in available:
+        chosen.append(p)
+        product *= p
+        if product > bound:
+            break
+    if product <= bound:
+        raise ValueError(
+            f"no available prime set is large enough: {len(chosen)} primes of "
+            f"order 2**{exponent} reach {product}, need more than {bound}"
+        )
+    return tuple(chosen)
+
+
+def primitive_root(p):
+    """A generator of the multiplicative group modulo p, via galois."""
+    return int(galois.primitive_root(p))
+
+
+class UnsupportedDimension(ValueError):
+    """Raised when the triple-correlation method cannot reach the dimension."""
+
+
+@functools.lru_cache(maxsize=None)
+def root_table(M, p, root):
+    """tab[i] = omega**i mod p for i in 0..M-1, omega = root**((p-1)//M).
+
+    Built by repeated modular multiplication. The vectorised-looking
+    np.power(omega, np.arange(M), p) is wrong twice over: numpy's power takes
+    no modulus, so the values overflow int64 long before the % p, and a single
+    butterfly stage needs only the first M/2 of them anyway. One Python pass per
+    (M, p) is negligible beside the O(M log M) transform it serves, and is
+    cached across every transform at that size.
+    """
+    omega = pow(root, (p - 1) // M, p)
+    if pow(omega, M, p) != 1 or pow(omega, M // 2, p) == 1:
+        raise ValueError(f"root {root} has no order {M} modulo {p}")
+    tab = np.empty(M, dtype=np.int64)
+    tab[0] = 1
+    for i in range(1, M):
+        tab[i] = tab[i - 1] * omega % p
+    return tab
+
+
+def ntt(a, p, root):
+    """Forward transform fhat[k] = sum_v a[v] omega**(v*k), omega of order len(a).
+
+    Iterative Cooley-Tukey, radix 2. The stage twiddles are
+    omega**(j*M/length) for j < length/2, which is the root table sliced with
+    stride M/length -- the even exponents, not the leading half of the table.
+    """
+    a = np.array(a, dtype=np.int64, copy=True)
+    M = len(a)
+    if M & (M - 1):
+        raise ValueError(f"transform length {M} is not a power of two")
+    if M == 1:
+        return a
+    j = 0
+    for i in range(1, M):
+        bit = M >> 1
+        while j & bit:
+            j ^= bit
+            bit >>= 1
+        j |= bit
+        if i < j:
+            a[i], a[j] = a[j], a[i]
+    tab = root_table(M, p, root)
+    length = 2
+    while length <= M:
+        half = length >> 1
+        tw = tab[0:M:(M // length)][:half]
+        blocks = a.reshape(-1, 2, half)
+        u = blocks[:, 0, :].copy()
+        v = blocks[:, 1, :] * tw % p
+        blocks[:, 0, :] = (u + v) % p
+        blocks[:, 1, :] = (u - v) % p
+        length <<= 1
+    return a
+
+
+def intt(a, p, root):
+    """Inverse of ntt, including the 1/M normalisation."""
+    M = len(a)
+    if M == 1:
+        return np.array(a, dtype=np.int64, copy=True)
+    inv_root = pow(root, p - 2, p)
+    return ntt(a, p, inv_root) * pow(M, p - 2, p) % p
+
+
+def embed(I, pad):
+    """I padded into the corner of a pad-shaped array, flattened row-major.
+
+    Row-major means the flat index of (y, x) is y*Mx + x, so a 2D shift
+    (dy, dx) is the flat shift dy*Mx + dx. That is the whole embedding trick:
+    one length-My*Mx transform serves the 2D problem.
+    """
+    rows, cols = pad
+    out = np.zeros((rows, cols), dtype=np.int64)
+    H, W = I.shape
+    out[:H, :W] = I
+    return out.ravel()
+
+
+def _offsets(pad, shape):
+    """Per-axis signed coordinates and the valid mask for every flat shift.
+
+    Coordinates are signed because a displacement of -1 and one of cols-1 are
+    the same shift on the torus, while the determinant has to be formed on the
+    signed representative to match definition.volume. Valid means the offset
+    could arise between two points of the image; T is zero for the rest, so
+    they are skipped rather than transformed.
+    """
+    rows, cols = pad
+    N = rows * cols
+    idx = np.arange(N, dtype=np.int64)
+    # x first: dx is fixed by s mod cols because dy*cols vanishes mod cols.
+    # Centring dx afterwards borrows from the row, so dy has to be recovered
+    # from the already-centred dx rather than from s // cols independently --
+    # centring both separately mislabels every shift whose dx is negative as a
+    # diagonal one.
+    dx = idx % cols
+    dx = np.where(dx >= cols // 2, dx - cols, dx)
+    dy = ((idx - dx) // cols) % rows
+    dy = np.where(dy >= rows // 2, dy - rows, dy)
+    H, W = shape
+    valid = (np.abs(dy) <= H - 1) & (np.abs(dx) <= W - 1)
+    return dy, dx, valid
+
+
+def triple_correlation(I, d2, pad, p, root, Ihat=None):
+    """One section T(., d2) of the three-point correlation, mod p.
+
+    Fixing d2 turns the three-point correlation into a two-point one: with
+    g = I * shift(I, d2) the section is the cyclic correlation of g with I, and
+    in the frequency domain
+
+        That[k] = ghat[-k] * Ihat[k]
+
+    with the negation on the *shifted* transform, not on I. Mirroring it the
+    other way still returns a plausible-looking array of the right shape, just
+    the wrong numbers, so the tests compare single entries against a direct
+    triple sum.
+
+    Returns the whole section, indexed by the flat shift of d1.
+    """
+    rows, cols = pad
+    N = rows * cols
+    shift = int(d2[0] * cols + d2[1]) % N
+    flat = embed(I, pad)
+    # np.roll(a, k)[v] is a[(v - k) % N], so the rolled operand is -shift: we
+    # want flat[(v + shift) % N]. The sign here is easy to get backwards, and
+    # getting it wrong yields a section of the right shape with plausible
+    # values, so the tests compare entries against a direct triple sum.
+    g = flat * np.roll(flat, -shift) % p
+    if Ihat is None:
+        Ihat = ntt(flat, p, root)
+    prod = ntt(g, p, root)[(-np.arange(N)) % N] * Ihat % p
+    return intt(prod, p, root)
+
+
+def spectrum_mod(I, p, root, pad=None):
+    """The area spectrum of I, computed mod p.
+
+    Streams the sections one at a time, adding each into the bins and
+    forgetting it. The full section is ((2H-1)(2W-1))^2 entries -- for a 32x32
+    image about 2.8 million, and for 64x64 about 2.5 * 10**8 -- and its sum by
+    volume is all the spectrum needs, so materialising it would buy nothing.
+    """
+    H, W = I.shape
+    if pad is None:
+        pad = pad_shape(I)
+    rows, cols = pad
+    N = rows * cols
+    n_spectrum = definition.spectrum_length(I)
+    dy, dx, valid = _offsets(pad, I.shape)
+    A = np.zeros(n_spectrum, dtype=np.int64)
+    Ihat = ntt(embed(I, pad), p, root)
+    for s2 in np.nonzero(valid)[0]:
+        s2 = int(s2)
+        if s2 == 0:
+            continue                       # d1 == d2 would repeat a point
+        b2y, b2x = int(dy[s2]), int(dx[s2])
+        # bin for every d1, and the pairs that keep the three points distinct
+        bins = np.abs(dy * b2x - dx * b2y)
+        keep = valid & (bins < n_spectrum) & (np.arange(N) != s2)
+        keep[0] = False                    # d1 == 0 repeats v0
+        T = triple_correlation(I, (b2y, b2x), pad, p, root, Ihat)
+        np.add.at(A, bins[keep], T[keep])
+        A %= p
+    return A
+
+
+def crt(residues, primes):
+    """Exact reconstruction from residues mod pairwise coprime primes.
+
+    Incremental: after each step x is the unique value in [0, product) matching
+    the residues seen so far. Valid only while the true value is below the
+    product, which bin_bound and area_spectrum_ntt together enforce.
+    """
+    x, m = int(residues[0]), primes[0]
+    for r, p in zip(residues[1:], primes[1:]):
+        t = (int(r) - x) * pow(m % p, p - 2, p) % p
+        x += m * t
+        m *= p
+    return x
+
+
+def primes_for(I, max_value=None):
+    """The primes needed for I, as (prime, primitive root) pairs.
+
+    Derived from the shape and dtype alone, so it is cached: two images of the
+    same type share one search. Each prime carries a root of unity of order
+    2**exponent, exponent being log2 of the padded transform length.
+
+    max_value tightens the bound below the dtype's range when the caller knows
+    the image is dim; see bin_bound for why the default is value-independent
+    and what that costs.
+    """
+    I = np.asarray(I)
+    bound = bin_bound(I, max_value)
+    key = I.dtype.str if max_value is None else (I.dtype.str, int(max_value))
+    chosen = primes_for_shape(tuple(I.shape), key, bound)
+    return [(p, primitive_root(p)) for p in chosen]
+
+
+def area_spectrum_ntt(I, pad=None, primes=None, max_value=None):
+    """The exact area spectrum of I, via sections and CRT.
+
+    Equals definition.area_spectrum(I) exactly, in integers. max_value is
+    forwarded to primes_for; see bin_bound for what it buys.
+    """
+    I = np.asarray(I)
+    if I.ndim != 2:
+        raise UnsupportedDimension(
+            f"triple correlation reaches 2D only: a {I.ndim}D volume is a "
+            f"{I.ndim}x{I.ndim} determinant needing {I.ndim} offsets, but a "
+            f"three-point correlation supplies two. A {I.ndim}D version needs a "
+            f"{I.ndim + 1}-point correlation and one section per "
+            f"({I.ndim - 1})-tuple of offsets, not per offset."
+        )
+    if primes is None:
+        primes = primes_for(I, max_value)
+    residues = [spectrum_mod(I, p, root, pad) for p, root in primes]
+    ps = [p for p, _ in primes]
+    return [crt([r[k] for r in residues], ps) for k in
+            range(definition.spectrum_length(I))]
+
+
+class NTTBackend:
+    """A descent backend whose spectrum comes from the NTT path.
+
+    Satisfies descent.SpectrumBackend. The spectrum is the fast one; the row
+    sums and the gradient are delegated to definition.py. That asymmetry is
+    deliberate and is not a speed claim -- descent calls the gradient once per
+    iteration and evaluates the loss once per candidate, so this backend
+    demonstrates that the seam works against a genuinely different
+    implementation rather than delivering an end-to-end speedup.
+    """
+
+    def __init__(self, pad=None, primes=None, max_value=None):
+        self.pad = pad
+        self.primes = primes
+        self.max_value = max_value
+
+    def area_spectrum(self, I):
+        return area_spectrum_ntt(I, self.pad, self.primes, self.max_value)
+
+    def jacobian_row_sums(self, I):
+        return definition.jacobian_row_sums(I)
+
+    def spectrum_gradient(self, I, target, scale):
+        return definition.spectrum_gradient(I, target, scale)

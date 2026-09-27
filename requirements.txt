@@ -1,0 +1,6 @@
+# Runtime dependencies, pinned to the versions the reference was verified
+# against. galois is used only by ntt_spectrum.py, for next_prime/is_prime in
+# the NTT prime search and for primitive roots.
+galois==0.4.11
+numpy==2.5.2
+sympy==1.14.0
