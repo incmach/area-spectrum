@@ -2,60 +2,71 @@
 
 ## Release 0.1 – Python Prototype
 
-**Description:** A working Python prototype that loads a small grayscale image, computes its area spectrum, visualizes it in a normalized way between two “basic” images, allows interactive editing of the spectrum, and reconstructs the image via steepest descent with integer steps.
+**Description:** A working Python prototype that loads a small grayscale image, computes its area spectrum, visualizes the user’s edits to that spectrum as a windowed view of normalized deltas, allows interactive editing of those deltas, and reconstructs the image via steepest descent with integer steps.
 
 - [ ] **T0.1-01** Implement function to load a small grayscale image using OpenCV.
   - [ ] Write `load_image(path)` that reads an image file, converts to grayscale, returns a 2D NumPy array.
   - [ ] Add basic error handling (file not found, unsupported format).
   - [ ] Optionally resize image if larger than a threshold (e.g., 64×64 for prototyping).
 
-- [ ] **T0.1-02** Implement area spectrum computation using triple correlation sections.
-  - [ ] Write a brute‑force reference implementation that loops over all pixel triples and counts triangles by area (σ = 0…W*H). This will be used only for testing.
-  - [ ] Research and implement the efficient triple‑correlation‑based method for area spectrum:
-    - [ ] Compute triple correlation of the image (using NTT or direct convolution).
-    - [ ] Extract sections where the absolute determinant of the 2×2 matrix formed by the three points equals σ.
-    - [ ] Sum the values to produce the 1D spectrum array.
-  - [ ] Verify the efficient implementation against the brute‑force on small random and structured images.
+- [x] **T0.1-02** Implement area spectrum computation using triple correlation sections.
+  - [x] Write a brute‑force reference implementation that loops over all pixel triples and counts triangles by area (σ = 0…W*H). It is the test oracle for the efficient path, and also the default `descent` backend, so it must stay simple rather than fast.
+  - [x] Research and implement the efficient triple‑correlation‑based method for area spectrum:
+    - [x] Compute triple correlation of the image (using NTT or direct convolution).
+    - [x] Extract sections where the absolute determinant of the 2×2 matrix formed by the three points equals σ.
+    - [x] Sum the values to produce the 1D spectrum array.
+  - [x] Verify the efficient implementation against the brute‑force on small random and structured images.
 
-- [ ] **T0.1-03** Write unit tests comparing spectrum output against a brute‑force reference.
-  - [ ] Create a set of small test images (e.g., 4×4, 8×8) with known or easily computable spectra.
-  - [ ] Write pytest tests that assert the efficient spectrum matches the brute‑force within floating‑point tolerance.
-  - [ ] Include edge cases (all‑zero image, all‑one image, single pixel).
+- [x] **T0.1-03** Write unit tests comparing spectrum output against a brute‑force reference.
+  - [x] Create a set of small test images (e.g., 4×4, 8×8) with known or easily computable spectra.
+  - [x] Write pytest tests that assert the efficient spectrum matches the brute‑force within floating‑point tolerance.
+  - [x] Include edge cases (all‑zero image, all‑one image, single pixel).
 
-- [ ] **T0.1-04** Research and implement visualization of the 1D spectrum as an array of pixels, normalized between two “basic” images (all‑zero and all‑one) to make values distinguishable.
-  - [ ] Compute the area spectra of the two basic images (all‑zero, all‑one) and store them.
-  - [ ] Define a mapping function that takes the current spectrum and linearly scales each bin between the corresponding bin values of the two basic spectra (or applies an appropriate transformation if linear is insufficient).
-  - [ ] Implement a visualization widget (e.g., Matplotlib figure) that displays the spectrum as a row of pixels using the normalized values.
+- [ ] **T0.1-04** Research and implement visualization of the 1D spectrum as a windowed view of normalized deltas, with 127 as the neutral value.
+  - [ ] Display what the user is actually editing: the normalized residual `delta[k] = (edited_target[k] - spectrum(I)[k]) / scale[k]`, i.e. the same quantity `descent.spectrum_residual_loss` minimises, rather than a spectrum normalized between two “basic” images.
+  - [ ] Map `delta` to a byte per bin with **127 as zero** (unchanged = no requested change), so the display is a signed view: 0 is maximally negative, 127 neutral, 255 maximally positive.
+  - [ ] Make the window half-width an explicit, adjustable parameter (`byte = clip(127 + round(127 * delta[k] / window), 0, 255)`), since the normalized residual is unbounded and a fixed window would clip or wash out large edits.
+  - [ ] Decide and document the rendering of bins with `scale[k] == 0`: they are unreachable by any one-pixel step, so a delta there cannot be expressed — skip them rather than divide by zero, matching the loss.
+  - [ ] Handle bin 0, which collects the degenerate (collinear / repeated-point) cases and is not reached by the same offset pairs as the rest.
+  - [ ] Use a diverging colormap centered on 127 so the sign is readable at a glance; a sequential map would hide which side of neutral a bin is on.
+  - [ ] Implement a visualization widget (e.g., Matplotlib figure) that displays the delta row as pixels.
   - [ ] Allow zooming/panning if the number of bins is large.
 
-- [ ] **T0.1-05** Add mouse (and optional keyboard) interaction to modify spectrum values slightly.
+- [ ] **T0.1-05** Add mouse (and optional keyboard) interaction to modify the normalized delta of a bin.
   - [ ] Implement a callback that detects mouse clicks on the spectrum display and identifies which bin was clicked.
-  - [ ] Enable dragging to increase/decrease the selected bin’s value (with integer or fractional step).
-  - [ ] Add keyboard shortcuts (e.g., arrow keys) to nudge the selected bin.
-  - [ ] Store the edited spectrum in a separate array.
+  - [ ] Enable dragging to increase/decrease the selected bin’s delta, in units of the normalized delta (a fixed fraction of the window) rather than in raw bin units, so a drag feels the same magnitude on every bin.
+  - [ ] Add keyboard shortcuts (e.g., arrow keys) to nudge the selected bin’s delta.
+  - [ ] Keep the edited target spectrum in a separate array, derived from the deltas as `target[k] = spectrum(I)[k] + delta[k] * scale[k]` rounded back to a nonnegative integer; the delta stays the source of truth and the target is what descent consumes.
+  - [ ] Reject edits to bins with `scale[k] == 0`, which no step can reach, and say so in the UI instead of silently ignoring the drag.
 
-- [ ] **T0.1-06** Implement steepest descent with integer steps: at each iteration change exactly one pixel by ±1 to reduce discrepancy with edited spectrum.
-  - [ ] Define an objective function: sum of squared differences between current image’s spectrum and the edited target spectrum.
-  - [ ] Derive (or research) the gradient of this objective with respect to image pixel values, expressed via triple correlation sections.
-  - [ ] Implement a function that, given the current image and target spectrum, computes an integer gradient direction (which pixel to change and in what direction).
-  - [ ] Implement the optimization loop:
-    - [ ] For each iteration, select one pixel and change its value by ±1 (or a small integer) according to the gradient.
-    - [ ] Recompute the spectrum (or update incrementally if possible).
-    - [ ] Check convergence criteria (e.g., no improvement for N iterations, maximum iterations reached).
-  - [ ] Add a simple line search or fixed step size; document the choice.
+- [x] **T0.1-06** Implement steepest descent with integer steps: at each iteration change exactly one pixel by ±1 to reduce discrepancy with edited spectrum.
+  - [x] Define an objective function: sum of squared differences between current image’s spectrum and the edited target spectrum.
+  - [x] Derive (or research) the gradient of this objective with respect to image pixel values, expressed via triple correlation sections.
+  - [x] Implement a function that, given the current image and target spectrum, computes an integer gradient direction (which pixel to change and in what direction).
+  - [x] Implement the optimization loop:
+    - [x] For each iteration, select one pixel and change its value by ±1 according to the gradient. A larger step is unnecessary: the spectrum is exactly linear in any single pixel, so a ±k step is k repeated ±1 steps with the same ranking, only longer.
+    - [x] Recompute the spectrum (or update incrementally if possible).
+    - [x] Check convergence criteria (e.g., no improvement for N iterations, maximum iterations reached).
+  - [x] Add a simple line search or fixed step size; document the choice.
+    - [x] Fixed unit step, no line search. The step is exact rather than estimated, so there is no step size to search over; `width` widens the candidate pool per iteration instead, at `width` column evaluations per accepted step.
 
-- [ ] **T0.1-07** Compute integer gradient direction via triple correlation sections.
-  - [ ] This is a sub‑component of T0.1-06; ensure the function is separated and testable.
-  - [ ] Write unit tests that compare the gradient direction against a numerical finite‑difference approximation on small images.
+- [x] **T0.1-07** Compute integer gradient direction via triple correlation sections.
+  - [x] This is a sub‑component of T0.1-06; ensure the function is separated and testable.
+  - [x] Write unit tests that compare the gradient direction against a numerical finite‑difference approximation on small images.
 
-- [ ] **T0.1-08** Create UI loop that displays original image, spectrum, allows editing, runs optimization, and shows reconstructed image + recomputed spectrum.
+- [ ] **T0.1-08** Create UI loop that displays the image, the editable delta row, and descent progress.
   - [ ] Build a main application window (using OpenCV highgui or Matplotlib’s interactive mode) that shows:
-    - [ ] Original image.
-    - [ ] Current image (after optimization).
-    - [ ] Spectrum display (editable).
-    - [ ] Recomputed spectrum after optimization.
-  - [ ] Add a button or key press to start the optimization with the currently edited spectrum.
-  - [ ] After optimization, update the displayed image and recomputed spectrum.
+    - [ ] The current image.
+    - [ ] The delta row from T0.1-04, editable, with 127 as neutral.
+    - [ ] A progress indicator for a descent in flight (see below).
+  - [ ] Add a button or key press to start the optimization with the currently edited deltas.
+  - [ ] **Descent progress.** While a descent runs, replace the interactive spectrum editor with a progress display: the current loss, the accepted-step count, and the loss history, so a run that takes seconds is visibly working rather than frozen.
+    - [ ] `descent()` is currently a blocking call that returns only a finished `Descent`, so a progress display needs a way in: either a callback invoked per accepted step, or a generator that yields the running state and is resumed by the UI loop. Prefer a generator — it keeps `descent`’s signature and return value intact, and the UI stays in charge of pacing.
+    - [ ] Keep the UI responsive during the run, and allow the user to stop early (the `Descent` namedtuple already reports `stopped_early` for the patience case, which is a separate thing and should stay distinguishable from a user cancel).
+  - [ ] **On stop, show the result and clear the deltas.** When the descent ends and the user acknowledges the stop, display the updated image and zero the deltas.
+    - [ ] The rationale: the deltas were a request *relative to the image at the time of editing*, so once the image has moved they no longer describe the same request. The new image’s spectrum is the new baseline, and zeroing means the next round starts from “this image, unchanged” instead of replaying edits that have already been absorbed.
+    - [ ] Recompute the baseline (`area_spectrum` and the row sums) for the updated image before redrawing, since both are functions of the image and both are stale after a step.
+    - [ ] Show what was achieved before clearing — final loss, accepted steps, and whether patience ran out — because `stopped_early` means the target may still be reachable with a wider search or more patience, which the user cannot discover once the deltas are gone.
   - [ ] Allow repeated editing and optimization cycles.
 
 - [ ] **T0.1-09** Write basic documentation (README) explaining how to run and the algorithms used.
@@ -130,12 +141,13 @@
   - [ ] Create small prototypes with 1–2 frameworks to assess ease of use, performance, and suitability for displaying images and custom pixel‑based widgets.
   - [ ] Choose one and document the decision.
 
-- [ ] **T0.3-04** Implement GUI with spectrum visualization and image display using the chosen framework.
+- [ ] **T0.3-04** Implement GUI with the delta-row visualization and image display using the chosen framework.
   - [ ] Create the main application window.
   - [ ] Display the current image (as a bitmap/texture).
-  - [ ] Display the spectrum as a row of pixels, using the normalization method from 0.1.
-  - [ ] Implement mouse and keyboard interaction for editing the spectrum (similar to 0.1).
+  - [ ] Display the normalized delta row as pixels, using the windowed mapping and 127-neutral convention from 0.1 rather than a raw spectrum: the display is the residual the user is editing, not the spectrum itself.
+  - [ ] Implement mouse and keyboard interaction for editing the delta row (similar to 0.1).
   - [ ] Add a control (button, hotkey) to trigger optimization.
+  - [ ] Mirror the 0.1 interaction contract: show a progress display while descent runs, then on acknowledgement show the result image and zero the deltas.
 
 - [ ] **T0.3-05** Optimize performance: parallelism (`rayon`), SIMD, efficient memory layout.
   - [ ] Profile the code to identify bottlenecks (spectrum computation, gradient, optimization loop).
@@ -264,16 +276,16 @@
   - [ ] Fix any compilation errors specific to WASM (e.g., no `std::thread`, no `std::fs`).
   - [ ] Ensure all core functions are exported and callable from JavaScript.
 
-- [ ] **T0.6-04** Build web frontend with image display, spectrum visualization, and interactive editing.
+- [ ] **T0.6-04** Build web frontend with image display, the delta-row visualization, and interactive editing.
   - [ ] Choose a frontend approach: vanilla JavaScript + `wasm-bindgen`, or a Rust web framework (Yew/Seed) compiled to WASM.
   - [ ] Create a canvas element for displaying the image.
-  - [ ] Create a separate canvas or DOM element for the spectrum row (using the same normalization as desktop).
-  - [ ] Implement mouse events for editing the spectrum.
+  - [ ] Create a separate canvas or DOM element for the delta row, using the same windowed mapping and 127-neutral convention as the desktop build so a spectrum reads identically in both.
+  - [ ] Implement mouse events for editing the deltas.
 
 - [ ] **T0.6-05** Integrate reconstruction and iterative workflow in browser.
   - [ ] Call WASM functions to compute spectrum, perform optimization steps.
   - [ ] Update the UI after each iteration (or run optimization in a web worker to avoid blocking the main thread, if possible with WASM threads).
-  - [ ] Allow the user to edit spectrum, run optimization, and see results.
+  - [ ] Allow the user to edit the delta row, run optimization, see progress, and on stop see the result with the deltas cleared, matching the desktop workflow from 0.1.
 
 - [ ] **T0.6-06** Test across modern browsers; optimize for performance.
   - [ ] Test in Chrome, Firefox, Safari (and Edge).
