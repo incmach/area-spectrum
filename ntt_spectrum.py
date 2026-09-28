@@ -69,10 +69,22 @@ result is exact, not a tolerance, and the bound is asserted rather than assumed.
 The primes are searched for rather than hardcoded, because the 2-adic exponent
 they need is a property of the padded transform length, hence of the image
 shape, and hardcoding a table would have to anticipate every shape. For a
-required order 2**n the search takes the smallest primes of the form
-k*2**n + 1, which is exactly the set with a root of unity of that order, and
-checks each with galois.is_prime. This is the same family as the familiar
-998244353 = 119*2**23 + 1, reached here by search rather than by memory.
+required order 2**n a prime must be of the form k*2**n + 1, which is exactly
+the set with a root of unity of that order. This is the same family as the
+familiar 998244353 = 119*2**23 + 1, reached here by search rather than by
+memory.
+
+How many of them, and which, is settled by select_primes rather than left to a
+prefix. Every modulus is one pass over the sections and a pass costs the same
+whatever the modulus is, so the number of primes is the whole cost and the
+choice between equal-count sets is worth almost nothing. The fewest primes that
+clear the bound are therefore taken, and since the largest product of k primes
+is the product of the k largest, that means the largest ones available under
+the cap. Taking the *smallest* primes instead is the worst case for this
+question, needing two to two and a half times as many passes. The cap is
+2**31 for an arithmetic reason, not an algebraic one: the transform multiplies
+residues in int64, so p**2 has to fit, and overrunning that wraps silently
+rather than raising. See PRIME_CAP.
 
 The bound is deliberately independent of the pixel values, so the prime set is
 a function of the shape and dtype alone. That makes it cacheable across images
@@ -242,6 +254,115 @@ def _primes_of_order_2(exponent):
     return tuple(out)
 
 
+# The largest modulus a prime may have here, and the reason is arithmetic
+# rather than algebraic. The transform multiplies two residues in int64 --
+# `blocks[:, 1, :] * tw % p` in ntt, `tab[i-1] * omega % p` in root_table -- so
+# a modulus is only safe if p**2 still fits an int64, which means p < 2**31.5.
+# Overrunning that does not raise: the product wraps and the transform returns a
+# plausible array of wrong numbers, with at most a RuntimeWarning from the one
+# Python-level loop in root_table. So the cap is a correctness limit, not a
+# tuning knob.
+#
+# It is deliberately far below what galois itself would allow. galois stores
+# GF(2**63) elements in a native int64 array and only falls back to object at
+# GF(2**64), so 2**63 would have been the natural-looking answer; that is
+# unusable here, because the constraint is the int64 butterfly above and not
+# how galois happens to represent a field. Nothing in this module builds a
+# GF(2**63), so the looser limit buys nothing.
+PRIME_CAP = 2 ** 31 - 1
+
+# The uint widths a chosen prime is asked to fit in, smallest first. Only
+# consulted as a tie-break between equal-count candidates; see select_primes.
+_PRIME_DTYPE_CAPS = (8, 16, 32)
+
+
+@functools.lru_cache(maxsize=None)
+def _largest_primes_of_order_2(exponent, cap, count):
+    """The `count` largest primes p = k*2**exponent + 1 strictly below cap.
+
+    Ascending, as everywhere else here. Searched downward from cap because the
+    selection below wants the largest primes it can get: a modulus contributes
+    its whole size to the CRT product, so the biggest available ones reach the
+    bound in the fewest passes. Descending means stopping after a handful of
+    candidates instead of sieving the whole interval below cap.
+    """
+    step = 1 << exponent
+    out = []
+    candidate = (cap - 1) // step            # largest k with k*step + 1 < cap
+    while len(out) < count and candidate >= 1:
+        p = candidate * step + 1
+        if p < cap and galois.is_prime(p):
+            out.append(p)
+        candidate -= 1
+    out.reverse()
+    return tuple(out)
+
+
+@functools.lru_cache(maxsize=None)
+def select_primes(exponent, bound, cap=PRIME_CAP):
+    """Fewest 2**exponent-friendly primes below cap whose product clears bound.
+
+    CRT reconstructs a bin exactly when the product of the moduli exceeds an
+    upper bound on it, so a set qualifies as soon as its product does. The count
+    of primes is what that costs: every one of them is a full pass over the
+    sections, and a pass is a fixed amount of work whatever the modulus is --
+    measured flat, 25.0ms at p=257 against 25.6ms at p=1047041 on an 8x8, well
+    within the noise. Size buys nothing, count buys everything, so the count is
+    minimised first and only then is size taken into account.
+
+    Minimising the count is not a heuristic. The largest product any k primes
+    can have is the product of the k largest available, so the smallest k that
+    clears the bound is found by walking down from the top of the range and
+    stopping the moment the product is enough. The previous approach took the
+    smallest primes instead, which is the worst case for this question: it
+    multiplies the smallest numbers available and so needs the most of them.
+    That costs 1.3x to 2.5x more passes -- 17 primes down to 10 for an 8x8
+    int64 image, 5 down to 2 for a 4x4 uint8 one.
+
+    Among candidates of that same minimal count, the set whose largest member
+    fits the narrowest numpy integer type is preferred, so a smaller-dtype set
+    wins a tie rather than losing to a larger modulus for no gain. This is
+    inert at the present cap -- a minimal-count set is always uint32, because
+    reaching a large bound in few primes forces large primes -- and is kept
+    because it costs two cheap comparisons and would start to matter under a
+    cap low enough for uint8 or uint16 to be reachable.
+
+    Raises if the interval holds too few primes to clear the bound, rather than
+    silently returning a set that would reconstruct residues.
+    """
+    chosen = _largest_primes_of_order_2(exponent, cap, 64)
+    if not chosen or math.prod(chosen) <= bound:
+        # a bound can be an arbitrary-sized Python int, and formatting one into
+        # the message raises on Python 3.11+ past 4300 digits, so report the
+        # shortfall by bit length rather than by value
+        raise ValueError(
+            f"no set of order-2**{exponent} primes below {cap} reaches a "
+            f"product above a bound of {bound.bit_length()} bits: the best "
+            f"available is {math.prod(chosen).bit_length()} bits from "
+            f"{len(chosen)} primes. A modulus p needs p**2 to fit an int64, "
+            f"which caps it at {PRIME_CAP}, so the image is too large for exact "
+            f"CRT. Pass max_value to charge for the values actually present, or "
+            f"use a smaller image; definition.py has no such limit."
+        )
+    count = 0
+    product = 1
+    for p in reversed(chosen):
+        product *= p
+        count += 1
+        if product > bound:
+            break
+    # `count` primes is the minimum; the walk above found the first k that
+    # clears the bound, and every smaller k fails because it is a subset of it
+    chosen = chosen[-count:]
+    for width in _PRIME_DTYPE_CAPS:
+        if width >= 32:
+            break
+        narrower = _largest_primes_of_order_2(exponent, 1 << width, count)
+        if len(narrower) == count and math.prod(narrower) > bound:
+            return narrower
+    return chosen
+
+
 _INT64_MAX = int(np.iinfo(np.int64).max)
 
 
@@ -307,29 +428,21 @@ def row_sum_bound(I, max_value=None):
 
 @functools.lru_cache(maxsize=None)
 def primes_for_shape(shape, dtype, bound):
-    """Smallest prefix of 2**n-friendly primes whose product exceeds bound.
+    """Fewest 2**n-friendly primes whose product exceeds bound, capped at 2**31.
 
     Cached on (shape, dtype, bound). Shape fixes the transform length and so
     the required 2-adic exponent; dtype and shape together fix the bound; the
     bound fixes how many primes are needed. Two images of the same shape and
     dtype therefore share one prime set and one search.
+
+    The selection is select_primes: the count is minimised first, since every
+    prime is one pass over the sections and a pass costs the same at any
+    modulus. See there for why the largest primes under the cap are the ones
+    that get picked, and why the cap is 2**31 rather than anything looser.
     """
     n = pad_length_of_shape(shape)
     exponent = n.bit_length() - 1
-    available = _primes_of_order_2(exponent)
-    chosen = []
-    product = 1
-    for p in available:
-        chosen.append(p)
-        product *= p
-        if product > bound:
-            break
-    if product <= bound:
-        raise ValueError(
-            f"no available prime set is large enough: {len(chosen)} primes of "
-            f"order 2**{exponent} reach {product}, need more than {bound}"
-        )
-    return tuple(chosen)
+    return select_primes(exponent, bound)
 
 
 def primitive_root(p):
@@ -875,9 +988,7 @@ def jacobian_column_ntt(I, pixel, max_value=None):
     column = np.bincount(det[keep], weights=weights, minlength=n_spectrum)
     return [int(v) for v in column[:n_spectrum]]
 
-
 class NTTBackend:
-
     """A descent backend with every quantity on the correlation path.
 
     Satisfies descent.SpectrumBackend. The spectrum, the row sums and the

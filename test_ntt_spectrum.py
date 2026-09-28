@@ -179,6 +179,92 @@ def test_primes_for_honours_an_explicit_max_value():
     assert set(tight) <= set(default)
 
 
+def test_selected_primes_are_under_the_int64_safe_cap():
+    """p**2 must fit an int64 or the butterfly wraps and returns wrong numbers
+    without raising, so every modulus the module can pick is checked against
+    the cap that keeps the product inside int64."""
+    rng = np.random.default_rng(11)
+    for shape in [(2, 2), (3, 3), (5, 5), (8, 8)]:
+        for mv in (3, 255, 2 ** 63 - 1):
+            I = rng.integers(0, max(mv, 1) + 1, size=shape).astype(np.int64)
+            for ps in (primes_for(I, max_value=mv),
+                       primes_for_row_sums(I, max_value=mv)):
+                for p, _ in ps:
+                    assert p <= ntt_spectrum.PRIME_CAP, (p, shape)
+                    assert p * p < 2 ** 63, ("p**2 would overflow int64", p)
+
+
+def test_selection_minimises_the_number_of_primes():
+    """Every prime is one pass over the sections, and a pass costs the same at
+    any modulus, so the count is what matters. The minimum is the smallest k
+    whose k largest eligible primes clear the bound, and dropping one prime
+    must fall short -- otherwise the set is doing more work than asked."""
+    rng = np.random.default_rng(12)
+    for shape in [(3, 3), (6, 6), (8, 8)]:
+        for mv in (3, 255, 2 ** 63 - 1):
+            I = rng.integers(0, max(mv, 1) + 1, size=shape).astype(np.int64)
+            bound = ntt_spectrum.bin_bound(I, mv)
+            chosen = ntt_spectrum.select_primes(
+                ntt_spectrum.pad_length_of_shape(shape).bit_length() - 1, bound
+            )
+            assert math.prod(chosen) > bound, "product must clear the bound"
+            if len(chosen) > 1:
+                one_fewer = chosen[:-1]
+                assert math.prod(one_fewer) <= bound, (
+                    "the last prime is not needed; the count is not minimal"
+                )
+
+
+def test_selected_primes_are_valid_moduli_for_the_transform():
+    """A selected prime must actually carry a 2**exponent-th root of unity and
+    be prime, or the transform has no twiddle table to build."""
+    for exponent in range(2, 13):
+        for p in ntt_spectrum.select_primes(exponent, 10 ** 30):
+            assert ntt_spectrum.galois.is_prime(p), p
+            assert (p - 1) % (1 << exponent) == 0, (p, exponent)
+            omega = pow(ntt_spectrum.primitive_root(p), (p - 1) >> exponent, p)
+            assert pow(omega, 1 << exponent, p) == 1
+            assert pow(omega, 1 << (exponent - 1), p) != 1, (p, exponent)
+
+
+def test_selection_is_ascending_distinct_and_cached():
+    exponent = 8
+    bound = 10 ** 20
+    ntt_spectrum.select_primes.cache_clear()
+    first = ntt_spectrum.select_primes(exponent, bound)
+    second = ntt_spectrum.select_primes(exponent, bound)
+    assert first is second, "the selection should not run twice for one key"
+    assert list(first) == sorted(first)
+    assert len(set(first)) == len(first)
+    assert all(p <= ntt_spectrum.PRIME_CAP for p in first)
+
+
+def test_selection_prefers_a_narrower_dtype_when_one_suffices():
+    """Among equal-count sets the narrowest uint wins, so a small bound is
+    served by uint8 or uint16 moduli rather than uint32 ones. At the 2**31 cap
+    a large bound forces uint32 (there is no narrower way to reach it), but a
+    small one does not, and the tie-break is what picks the small primes."""
+    # a bound one uint8-clearing product wide: 193 * 257 is tiny, so the
+    # selection has room to choose the narrow class
+    tiny = ntt_spectrum.select_primes(6, 1)
+    assert all(p < 2 ** 16 for p in tiny), tiny
+    # a bound no uint8 or uint16 set can reach forces the wide class
+    huge = ntt_spectrum.select_primes(6, 2 ** 200)
+    assert max(huge) > 2 ** 16, huge
+
+
+def test_largest_primes_scan_returns_ascending_largest_below_the_cap():
+    found = ntt_spectrum._largest_primes_of_order_2(8, 1 << 20, 3)
+    assert list(found) == sorted(found)
+    assert len(found) == 3
+    assert all(p < (1 << 20) for p in found)
+    assert all((p - 1) % 256 == 0 for p in found)
+    # asking for more than exist below the cap returns everything, not padding
+    everything = ntt_spectrum._largest_primes_of_order_2(18, 1 << 20, 100)
+    assert len(everything) < 100
+    assert max(everything) < (1 << 20)
+
+
 def test_primes_for_shape_is_cached_and_keyed():
     ntt_spectrum.primes_for_shape.cache_clear()
     a = primes_for_shape((3, 3), "i8", 10 ** 20)
@@ -203,8 +289,12 @@ def test_primes_for_shape_product_exceeds_the_bound():
 
 
 def test_prime_search_raises_when_it_cannot_reach_the_bound():
-    with pytest.raises(ValueError, match="large enough"):
-        primes_for_shape((2, 2), "i8", 10 ** 400)
+    # a bound past the product of every eligible prime under the cap is an
+    # error, not a silently short set that would make CRT return residues.
+    # 10**400 is now reachable (64 large primes clear it), so the bound has to
+    # sit far past what a capped pool can supply.
+    with pytest.raises(ValueError, match="reaches a product above"):
+        primes_for_shape((2, 2), "i8", 1 << 40000)
 
 
 def test_dtype_max_covers_the_integer_dtypes():
@@ -270,8 +360,8 @@ def test_undersizing_the_bound_is_detectable():
     quadratic = (2 * 5 - 1) * (2 * 5 - 1) ** 2 * I.size * 9 ** 2
     assert quadratic < true_max
     # and a bound no available prime set can reach is an error, not a guess
-    with pytest.raises(ValueError, match="large enough"):
-        primes_for_shape((5, 5), "i8", 10 ** 400)
+    with pytest.raises(ValueError, match="reaches a product above"):
+        primes_for_shape((5, 5), "i8", 1 << 40000)
 
 
 def test_bin_bound_accepts_a_tighter_max_value():
@@ -1012,11 +1102,21 @@ def test_row_sum_bound_ignores_the_pixel_values():
 
 def test_undersizing_the_row_sum_bound_is_detectable():
     """One prime short of the bound gives a plausible wrong answer, so the
-    bound has to be an upper bound rather than an estimate."""
+    bound has to be an upper bound rather than an estimate.
+
+    The check is against the modulus *product*, not the smallest prime: the
+    selected moduli are now the largest under the cap, so a single one dwarfs
+    the true entries and comparing against it would pass vacuously. What has to
+    hold for exactness is that the product of the chosen primes exceeds the
+    largest true row sum, and that dropping one prime would not.
+    """
     I = np.full((3, 3), 4, dtype=np.int64)
     exact = jacobian_row_sums_ntt(I, max_value=4)
-    p = primes_for_row_sums(I, max_value=4)[0][0]
-    assert any(v >= p for v in exact)
+    ps = [p for p, _ in primes_for_row_sums(I, max_value=4)]
+    product = math.prod(ps)
+    assert max(exact) < product, "the product must cover the largest entry"
+    # one prime fewer must fall short, or the bound is looser than it needs to be
+    assert max(exact) > math.prod(ps[:-1]), "the last prime is load-bearing"
 
 
 # ---------------------------------------------------------------------------
