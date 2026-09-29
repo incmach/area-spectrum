@@ -932,11 +932,40 @@ def jacobian_row_sums_ntt(I, pad=None, primes=None, max_value=None):
             range(definition.spectrum_length(I))]
 
 
-def jacobian_column_ntt(I, pixel, max_value=None):
-    """The exact Jacobian column of I at `pixel`, in integers.
+# Below this many offsets the chunked path is the faster of the two. The
+# grouped one walks one direction at a time in Python, and a small image has too
+# few offsets per direction to amortise that against, so it loses until the
+# image is big enough. Measured: grouped/chunked is 0.56 at P = 256, 0.82 at
+# P = 576, and 1.57 at P = 1024, which puts the crossover at 32x32. The two
+# paths return identical integers, so this trades time and never the answer.
+_COLUMN_GROUPED_MIN_OFFSETS = 1024
 
-    Equals definition.jacobian_column(I, pixel) exactly. Reaches 2D only, like
-    the other correlation paths.
+# Peak elements of the block determinant a chunked column builds at once. The
+# block costs about 17 bytes per element (int64 det, int64 weights, bool keep),
+# so 2**21 is roughly 35 MB, which is the working set the unchunked path
+# reached already at 32x32. It bounds memory by a constant rather than by the
+# image, at the cost of re-reading vals a few times.
+_COLUMN_BLOCK_ELEMENTS = 1 << 21
+
+
+def _column_geometry(I, pixel):
+    """Validation, the int64 bound, and the offset window the column paths share.
+
+    Returns the offsets (dy, dx) that keep p + d inside the image, the pixel
+    values at them, and for each offset its primitive direction (a, b) and
+    its gcd g, so that d = g * (a, b).
+
+    The offsets that keep p + d inside the image are a rectangle, the same
+    shape as the image itself and much smaller at a corner than the full
+    (2H-1) x (2W-1) offset grid the spectrum loops over.
+
+    The column is 3 * sum over ordered offset pairs of I[p+d1] * I[p+d2], so
+    it is bounded by 3 * (sum of the pixels)**2 -- two factors of the pixel
+    value rather than three, and no dependence on the pixel count beyond that
+    sum. Well inside int64 for any real image, but not for an int64 one
+    holding values near 2**63, so the bound is checked rather than assumed and
+    the arithmetic is never silently wrapped. The sum is taken in Python
+    integers for the same reason: an int64 total would itself wrap.
     """
     I = np.asarray(I)
     if I.ndim != 2:
@@ -950,13 +979,6 @@ def jacobian_column_ntt(I, pixel, max_value=None):
     if not (0 <= py < H and 0 <= px < W):
         raise ValueError(f"pixel {tuple(pixel)} is not a coordinate of an image of shape {I.shape}")
     n_spectrum = definition.spectrum_length(I)
-    # The column is 3 * sum over ordered offset pairs of I[p+d1] * I[p+d2], so
-    # it is bounded by 3 * (sum of the pixels)**2 -- two factors of the pixel
-    # value rather than three, and no dependence on the pixel count beyond that
-    # sum. Well inside int64 for any real image, but not for an int64 one
-    # holding values near 2**63, so the bound is checked rather than assumed and
-    # the arithmetic is never silently wrapped. The sum is taken in Python
-    # integers for the same reason: an int64 total would itself wrap.
     total = sum(int(v) for v in I.ravel())
     bound = 3 * total * total
     if bound > _INT64_MAX:
@@ -964,29 +986,192 @@ def jacobian_column_ntt(I, pixel, max_value=None):
             f"a Jacobian column of this image would exceed int64 "
             f"(3 * sum**2 = {bound}); reduce the pixel range"
         )
-    # The offsets that keep p + d inside the image: a rectangle, which is the
-    # same shape as the image itself and much smaller at a corner than the
-    # full (2H-1) x (2W-1) offset grid the spectrum loops over.
     dy = np.arange(-py, H - py)
     dx = np.arange(-px, W - px)
     grid_y, grid_x = np.meshgrid(dy, dx, indexing="ij")
-    dy = grid_y.ravel()
-    dx = grid_x.ravel()
+    dy = grid_y.ravel().astype(np.int64)
+    dx = grid_x.ravel().astype(np.int64)
     vals = I[py + dy, px + dx].astype(np.int64)
-    det = np.abs(dy[:, None] * dx[None, :] - dx[:, None] * dy[None, :])
-    # d1 and d2 must be distinct non-zero offsets. Distinct because the tuple
-    # must not name a point twice, non-zero for the same reason; either one
-    # gives det = 0, so a pair with either is in bin 0 and has to be removed
-    # from there rather than by its determinant.
-    keep = (
-        (det < n_spectrum)
-        & ((dy[:, None] != 0) | (dx[:, None] != 0))
-        & ((dy[None, :] != 0) | (dx[None, :] != 0))
-        & ~np.eye(len(dy), dtype=bool)
-    )
-    weights = (3 * vals[:, None] * vals[None, :])[keep]
-    column = np.bincount(det[keep], weights=weights, minlength=n_spectrum)
-    return [int(v) for v in column[:n_spectrum]]
+    # The primitive direction of each offset, with the zero offset left as
+    # (0, 0): it is not a direction, and it is excluded from every bin anyway.
+    g = np.gcd(np.abs(dy), np.abs(dx))
+    g = np.where(g == 0, 1, g)
+    return dy, dx, vals, g, dy // g, dx // g, n_spectrum
+
+
+def _line_keys(a, b):
+    """Integer keys that are equal exactly for offsets on one unoriented line.
+
+    A line through the origin is an unordered pair of opposite directions, so
+    (a, b) and (-a, -b) have to land on the same key; any other pair must not.
+    Negating into a half-plane with the first nonzero component positive picks
+    exactly one of the two, and packing into a single integer keeps the grouping
+    inside numpy instead of a Python dict.
+    """
+    a = np.array(a, dtype=np.int64, copy=True)
+    b = np.array(b, dtype=np.int64, copy=True)
+    flip = (a < 0) | ((a == 0) & (b < 0))
+    a[flip] = -a[flip]
+    b[flip] = -b[flip]
+    return a, b
+
+
+def _bin0_by_line(vals, a, b, nonzero, n_spectrum):
+    """Bin 0 alone: the weighted count of collinear offset pairs.
+
+    A pair has determinant zero exactly when its two offsets are parallel, i.e.
+    lie on one unoriented line through p, so bin 0 is the sum over lines of the
+    ordered pairs of *distinct* offsets on that line. For a line whose offsets
+    carry values v_i, that count is
+
+        (sum_i v_i)**2 - sum_i v_i**2
+
+    -- the square counts every ordered pair including the diagonal, and the
+    subtracted sum of squares is exactly that diagonal, which is what the
+    distinctness restriction removes. Doing it per line rather than per pair
+    turns bin 0 from quadratic into linear, and it is the only bin where the
+    d1 != d2 restriction bites at all: a non-zero determinant already forces
+    affine independence, hence d1, d2 non-zero and distinct.
+    """
+    column = np.zeros(n_spectrum, dtype=np.int64)
+    a, b = _line_keys(a[nonzero], b[nonzero])
+    v = vals[nonzero]
+    if v.size == 0:
+        return column
+    keys, inverse = np.unique(a * (2 * a.size + 1) + b, return_inverse=True)
+    totals = np.zeros(keys.size, dtype=np.int64)
+    np.add.at(totals, inverse, v)
+    squares = np.zeros(keys.size, dtype=np.int64)
+    np.add.at(squares, inverse, v * v)
+    column[0] = 3 * int(np.sum(totals * totals - squares, dtype=np.int64))
+    return column
+
+
+def jacobian_column_chunked(I, pixel, max_value=None):
+    """The exact Jacobian column, in determinant blocks of bounded size.
+
+    Equals definition.jacobian_column(I, pixel) exactly. The offsets d1 are
+    taken a block at a time rather than all at once, so the P x P determinant
+    becomes a block x P one and the peak memory stops growing with the image:
+    128x128 needs 8.4 GB unchunked and about 35 MB here for the same answer.
+
+    Time is unchanged at O(P^2) -- the same products are formed -- so this buys
+    memory and nothing else. It stays the path for small images, where the
+    block loop has little to amortise and the direction grouping below has
+    correspondingly less to work with.
+    """
+    dy, dx, vals, _g, a, b, n_spectrum = _column_geometry(I, pixel)
+    P = dy.size
+    nonzero = (dy != 0) | (dx != 0)
+    column = _bin0_by_line(vals, a, b, nonzero, n_spectrum)
+    width = max(1, min(P, _COLUMN_BLOCK_ELEMENTS // max(P, 1)))
+    dx_row = dx[None, :]
+    dy_col = dy[None, :]
+    for start in range(0, P, width):
+        stop = min(start + width, P)
+        det = np.abs(dy[start:stop, None] * dx_row - dx[start:stop, None] * dy_col)
+        # det > 0 is the whole of the admissibility test for a nonzero bin. A
+        # zero or repeated offset gives det = 0, so keeping only the nonzero
+        # entries keeps exactly the admissible pairs and needs no diagonal mask
+        # and no nonzero test; bin 0 carries the collinear pairs and took care
+        # of the exclusions there. The determinant is absolute, so both
+        # orderings of a pair are present and the weight stays 3, matching the
+        # ordered sum in definition.jacobian_column.
+        keep = (det > 0) & (det < n_spectrum)
+        weights = 3 * vals[start:stop, None] * vals[None, :]
+        np.add.at(column, det[keep], weights[keep])
+    return [int(v) for v in column]
+
+
+def jacobian_column_by_direction(I, pixel, max_value=None):
+    """The exact Jacobian column, grouping the offsets by direction.
+
+    Equals definition.jacobian_column(I, pixel) exactly. Same O(P^2) arithmetic
+    as the chunked path but O(P) peak memory instead of O(P * block), and
+    several times faster in practice: 128x128 takes 1.2 s against 13.4 s.
+
+    An offset is g * (a, b) for a primitive direction (a, b), and
+    |det(d1, d2)| = g1 * g2 * |a1 * b2 - b1 * a2|. Fixing the primitive
+    direction (a, b) of one offset, the expression t = a * dx - b * dy is a
+    single linear form in the other, so the determinants of every pair on that
+    ray are a fixed multiple of a one-dimensional histogram of t. Binning t
+    once per ray and scattering the ray's members into the bins is what removes
+    the P x P array -- no pair of offsets is ever held at the same time.
+
+    This is the reason the transform does not reach a column. The spectrum is
+    O(P^1.5 log P) because the anchor v is summed over, which turns the
+    evaluation at an offset pair into a correlation that NTTs can carry; a
+    column fixes the anchor, so nothing is left to convolve and a transform
+    would cost O(P^2 log P), worse than either path here.
+    """
+    dy, dx, vals, g, a, b, n_spectrum = _column_geometry(I, pixel)
+    nonzero = (dy != 0) | (dx != 0)
+    column = _bin0_by_line(vals, a, b, nonzero, n_spectrum)
+    members = np.flatnonzero(nonzero)
+    if members.size == 0:
+        return [int(v) for v in column]
+    # Group the non-zero offsets by *oriented* primitive direction. The key is
+    # injective because a and b are coprime-free bounded components packed into
+    # one integer; a stable sort then makes each ray a contiguous run.
+    key = a[members] * (2 * a.size + 1) + b[members]
+    order = np.sort(np.argsort(key, kind="stable"))
+    cuts = np.flatnonzero(key[order][1:] != key[order][:-1]) + 1
+    for ray in np.split(order, cuts):
+        # ray indexes into the members array, so the offset it names -- and
+        # hence the primitive direction of the ray -- is members[ray[0]].
+        aa, bb = int(a[members[ray[0]]]), int(b[members[ray[0]]])
+        # t = a * dx - b * dy is the cofactor linear form on this ray, and
+        # |det| for a member with gcd gi is gi * |t|. The zero offset is not a
+        # member and t = 0 is skipped below, since a d2 parallel to d1 is
+        # collinear and hence bin 0, which _bin0_by_line already counted.
+        t = aa * dx - bb * dy
+        lo, hi = int(t.min()), int(t.max())
+        # Every entry of hist is a sum of pixel values, hence at most
+        # sum(I), hence at most 2**53 (the int64 bound above caps sum(I) at
+        # 1.75e9), so the float64 bincount below is exact. Only the histogram
+        # may use bincount; the bins of the column are sums of products and are
+        # accumulated with add.at on int64, per the note at the top of this
+        # module.
+        hist = np.bincount((t - lo)[members], weights=vals[members].astype(np.float64),
+                           minlength=hi - lo + 1).astype(np.int64)
+        # Scan the *bins* of the histogram, not the offsets: several offsets
+        # share a t, and the bin is the value that must be scattered once. The
+        # attained non-zero cofactors are the occupied bins, and t = 0 is left
+        # out because a d2 parallel to d1 is collinear, hence bin 0, which
+        # _bin0_by_line already counted.
+        occupied = np.flatnonzero(hist)
+        cofactors = (occupied + lo).astype(np.int64)
+        nonzero_cofactor = cofactors != 0
+        cofactors = cofactors[nonzero_cofactor]
+        if cofactors.size == 0:
+            continue
+        scale = np.abs(cofactors)
+        values = hist[occupied[nonzero_cofactor]]
+        for m in ray:
+            # m is a position in `members` for the gcd and the value too, not
+            # just for the direction above.
+            offset = members[m]
+            bins = int(g[offset]) * scale
+            keep = bins < n_spectrum
+            np.add.at(column, bins[keep], 3 * int(vals[offset]) * values[keep])
+    return [int(v) for v in column]
+
+
+def jacobian_column_ntt(I, pixel, max_value=None):
+    """The exact Jacobian column of I at `pixel`, in integers.
+
+    Equals definition.jacobian_column(I, pixel) exactly. Reaches 2D only, like
+    the other correlation paths.
+
+    Dispatches to the direction-grouped column for images big enough to pay for
+    it and to the chunked one otherwise; the two agree exactly, so the choice is
+    a time-and-memory trade rather than a change of answer. The name keeps its
+    "ntt" for the family rather than for a transform, which this does not use.
+    """
+    if int(np.asarray(I).size) >= _COLUMN_GROUPED_MIN_OFFSETS:
+        return jacobian_column_by_direction(I, pixel, max_value)
+    return jacobian_column_chunked(I, pixel, max_value)
+
 
 class NTTBackend:
     """A descent backend with every quantity on the correlation path.

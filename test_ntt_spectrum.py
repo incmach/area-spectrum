@@ -604,6 +604,331 @@ def test_spectrum_mod_is_a_residue_not_the_count():
 
 
 # ---------------------------------------------------------------------------
+# the column
+# ---------------------------------------------------------------------------
+
+# Both column paths are checked against definition.jacobian_column rather than
+# against each other, since each is a rearrangement whose failure is a plausible
+# integer rather than an exception. The shapes are chosen for what they break:
+# 1x1 and 1x2 have no two independent offsets at all, 2x1 and 3x1 have offsets
+# along one axis only, and the ragged ones (5x3, 7x5, 8x4, 2x11) have an
+# offset window that is not symmetric about the anchor. They are all small,
+# because the reference walks every ordered triple of pixels and is cubic in
+# the pixel count; the cross-check between the two paths below is what reaches
+# the sizes the reference cannot.
+COLUMN_SHAPES = [
+    (1, 1), (1, 2), (2, 1), (1, 3), (3, 1), (2, 2), (2, 3), (3, 2), (3, 3),
+    (4, 4), (4, 5), (5, 4), (5, 3), (3, 5), (6, 6), (7, 5), (8, 4), (4, 8),
+    (2, 11), (1, 16), (16, 1),
+]
+
+
+@pytest.mark.parametrize("shape", COLUMN_SHAPES)
+def test_column_paths_agree_with_the_reference(shape):
+    """Every pixel of every shape, at three value ranges.
+
+    A reference column is cubic in the offsets, so the small shapes are what
+    can be compared exhaustively -- but they are also the shapes that still
+    contain the degenerate cases, which concentrate at the corners and edges of
+    the offset window.
+    """
+    rng = np.random.default_rng(20260929)
+    for hi in (2, 3, 50):
+        I = rng.integers(0, hi, size=shape).astype(np.int64)
+        for p in np.ndindex(shape):
+            want = definition.jacobian_column(I, p)
+            assert ntt_spectrum.jacobian_column_chunked(I, p) == want, (shape, p, hi)
+            assert ntt_spectrum.jacobian_column_by_direction(I, p) == want, (shape, p, hi)
+            assert ntt_spectrum.jacobian_column_ntt(I, p) == want, (shape, p, hi)
+
+
+def test_the_two_column_paths_agree_where_the_reference_cannot_reach():
+    """Cross-check the paths on images the cubic reference is too slow for.
+
+    The chunked and direction-grouped columns are different rearrangements of
+    the same sum -- blocks of a determinant matrix against per-ray histograms --
+    so agreeing on a 32x32 is evidence of something that agreeing with the
+    reference on a 4x4 is not: the two share a setup and a bin-0 rule, but
+    neither shares a way of forming the nonzero bins. The sizes chosen straddle
+    the dispatch threshold and are large enough for the chunked path to take
+    more than one block at its default width.
+    """
+    rng = np.random.default_rng(20260933)
+    for shape in [(23, 23), (32, 32), (48, 32)]:
+        I = rng.integers(0, 12, size=shape).astype(np.int64)
+        for p in [(0, 0), (shape[0] // 2, shape[1] // 2), (shape[0] - 1, shape[1] - 1)]:
+            chunked = ntt_spectrum.jacobian_column_chunked(I, p)
+            grouped = ntt_spectrum.jacobian_column_by_direction(I, p)
+            assert chunked == grouped, (shape, p)
+            assert ntt_spectrum.jacobian_column_ntt(I, p) == chunked, (shape, p)
+
+
+def test_a_column_sums_over_ordered_pairs():
+    """The sum is over ordered (d1, d2), so swapping them does not cancel.
+
+    A determinant changes sign under the swap and the weight 3 * v1 * v2 does
+    not, so a nonzero-bin test that filters on det > 0 rather than det != 0
+    keeps only one of the two orderings. It returns a plausible column of half
+    the size and nothing raises. The three lit pixels here are a unit triangle,
+    so the column at any of its corners is the two orderings of the other two
+    offsets, weighted 3 each.
+    """
+    I = np.zeros((4, 4), dtype=np.int64)
+    I[1, 1] = 1
+    I[1, 2] = 1
+    I[2, 1] = 1
+    for p in [(1, 1), (1, 2), (2, 1)]:
+        want = definition.jacobian_column(I, p)
+        assert want[1] == 6, (p, "two orderings, weight 3, values of 1")
+        assert ntt_spectrum.jacobian_column_chunked(I, p) == want, p
+        assert ntt_spectrum.jacobian_column_by_direction(I, p) == want, p
+
+
+def test_bin_zero_is_counted_per_line_and_not_per_pair():
+    """Bin 0 is the one bin where the distinctness restriction bites.
+
+    A zero determinant means collinear, and that is exactly what removes the
+    degenerate pairs: d1 = 0, d2 = 0 and d1 = d2 all give determinant 0, so
+    every pair in a nonzero bin already has distinct non-zero offsets and the
+    nonzero bins need no exclusions at all. Bin 0 is then the sum over the
+    lines through the anchor of the ordered *distinct* pairs on that line,
+    which is (sum of the values)**2 less the sum of their squares -- the
+    subtracted term being the diagonal. Three lit pixels on one line through
+    the anchor fill bin 0, and a fourth off the line fills the nonzero bins in
+    the same column, so one image exercises both halves. The values are uneven
+    so that a swapped sum of squares could not be confused with the right one.
+    """
+    I = np.zeros((6, 6), dtype=np.int64)
+    I[2, 2] = 4
+    I[3, 3] = 6          # collinear with the anchor
+    I[4, 4] = 7          # collinear, a second pair on the same line
+    I[2, 4] = 5          # not collinear with it
+    p = (2, 2)
+    want = definition.jacobian_column(I, p)
+    # Bin 0 is the two lit offsets on the diagonal, 6 and 7, taken in both
+    # orders and weighted 3 each. A triangle needs three distinct points, so
+    # this term is a degenerate tuple that bin 0 alone can hold.
+    assert want[0] == 3 * (6 * 7 + 7 * 6) == 252
+    assert any(want[1:]), "the off-line pixel should fill a nonzero bin"
+    for fn in (ntt_spectrum.jacobian_column_chunked,
+               ntt_spectrum.jacobian_column_by_direction,
+               ntt_spectrum.jacobian_column_ntt):
+        assert fn(I, p) == want, fn.__name__
+
+
+def test_the_grouped_path_scans_histogram_bins_rather_than_offsets():
+    """Two offsets on one ray can share a cofactor, and the bin is what counts.
+
+    The grouped path bins a cofactor t = a*dx - b*dy, so an offset maps to a
+    bin and the histogram entry is the sum over every offset landing in it;
+    the bin is then scattered once per member of the ray. Reading the
+    cofactors off the offsets instead -- the obvious way to write it, since t
+    is an array over offsets -- scatters the same bin once per offset sharing
+    it and inflates every nonzero bin. Three lit pixels in a row give two
+    members of one ray whose cofactors coincide with an outside offset.
+    """
+    I = np.zeros((5, 5), dtype=np.int64)
+    I[1, 1] = 1
+    I[1, 2] = 1
+    I[1, 3] = 1
+    p = (1, 1)
+    want = definition.jacobian_column(I, p)
+    assert ntt_spectrum.jacobian_column_by_direction(I, p) == want
+    assert ntt_spectrum.jacobian_column_chunked(I, p) == want
+
+
+def test_a_column_survives_an_image_with_no_triangle_in_it():
+    """No pixels, or one, means no bins, and the window always holds the anchor.
+
+    The offset window contains the zero offset whatever the image, and its
+    value is the anchor's own pixel value, so a path that failed to exclude it
+    would pair the anchor with itself and report a bin of 3 * I[p]**2. The 1x1
+    case is the extreme: the window is the single zero offset and there is
+    nothing to pair it with.
+    """
+    for shape in [(1, 1), (1, 3), (3, 1), (2, 2), (3, 3)]:
+        for pixel in [None] + list(np.ndindex(shape)):
+            I = np.zeros(shape, dtype=np.int64)
+            if pixel is not None:
+                I[pixel] = 7
+            for p in np.ndindex(shape):
+                want = definition.jacobian_column(I, p)
+                for fn in (ntt_spectrum.jacobian_column_chunked,
+                           ntt_spectrum.jacobian_column_by_direction,
+                           ntt_spectrum.jacobian_column_ntt):
+                    assert fn(I, p) == want, (shape, p, pixel, fn.__name__)
+
+
+def test_chunking_splits_the_offsets_without_changing_the_column():
+    """The block width is a memory knob and must not be load-bearing.
+
+    A loop that dropped its last block, or ran one twice, would still be right
+    at whatever width happened to divide the offset count evenly, so the width
+    is pinned to 1 -- every block a single offset, which is the case where an
+    off-by-one in the range is visible at all.
+    """
+    rng = np.random.default_rng(20260930)
+    I = rng.integers(0, 9, size=(6, 5)).astype(np.int64)
+    real = ntt_spectrum._COLUMN_BLOCK_ELEMENTS
+    try:
+        for width in (1, 2, 3, 7, 10 ** 9):
+            ntt_spectrum._COLUMN_BLOCK_ELEMENTS = width
+            for p in np.ndindex(I.shape):
+                assert ntt_spectrum.jacobian_column_chunked(I, p) == \
+                    definition.jacobian_column(I, p), (width, p)
+    finally:
+        ntt_spectrum._COLUMN_BLOCK_ELEMENTS = real
+
+
+def test_a_column_is_exact_above_2_53():
+    """A column bin is a sum of products, so it crosses 2**53 by itself.
+
+    This is the case the note at the top of the module about np.add.at against
+    np.bincount is about, and the implementation this replaces did use
+    bincount and returned 2256921758191792640 here -- a plausible-looking
+    integer, short by 298. The pixels are 28-bit and the image sums to 1.29e9,
+    inside the 1.75e9 the int64 bound permits, so nothing else objects.
+    """
+    I = np.array([[220563827, 275246345],
+                  [347709971, 450188433]], dtype=np.int64)
+    want = definition.jacobian_column(I, (0, 0))
+    assert want == [0, 2256921758191792938, 0, 0]
+    assert want[1] > 2 ** 53
+    assert 3 * int(I.sum()) ** 2 < 2 ** 63, "the int64 bound should admit it"
+    assert ntt_spectrum.jacobian_column_chunked(I, (0, 0)) == want
+    assert ntt_spectrum.jacobian_column_by_direction(I, (0, 0)) == want
+    assert ntt_spectrum.jacobian_column_ntt(I, (0, 0)) == want
+
+
+def test_the_one_float64_sum_left_in_a_column_adds_up_pixels():
+    """The grouped histogram bins single pixel values, so float64 is exact.
+
+    Worth pinning rather than assuming: a histogram entry sums the offsets
+    sharing a cofactor, hence at most sum(I), and the int64 bound caps sum(I)
+    at sqrt(2**63/3) ~ 1.75e9, six orders of magnitude below 2**53. Were the
+    bound ever loosened, the histogram would have to change with it, and this
+    is the test that would say so.
+    """
+    I = np.array([[220563827, 275246345],
+                  [347709971, 450188433]], dtype=np.int64)
+    assert int(I.sum()) < 2 ** 53
+    assert int(np.sqrt(2 ** 63 // 3)) < 2 ** 53
+    for p in np.ndindex(I.shape):
+        assert ntt_spectrum.jacobian_column_by_direction(I, p) == \
+            definition.jacobian_column(I, p), p
+
+
+def test_the_dispatcher_picks_a_path_and_both_give_the_same_column():
+    """Whichever path the size threshold picks, the answer is the reference.
+
+    The threshold is a time-and-memory trade, so retuning it is safe only
+    because the two paths are interchangeable; this keeps that true across the
+    cut rather than at it. The shapes on either side are taken from the
+    measured crossover, so a threshold moved without remeasuring would show up
+    here as a shape that has quietly changed sides.
+    """
+    rng = np.random.default_rng(20260931)
+    for shape in [(4, 4), (16, 16), (23, 23), (32, 32), (33, 31), (48, 32)]:
+        I = rng.integers(0, 9, size=shape).astype(np.int64)
+        for p in [(0, 0), (shape[0] // 2, shape[1] // 2), (shape[0] - 1, shape[1] - 1)]:
+            want = ntt_spectrum.jacobian_column_chunked(I, p)
+            assert want == ntt_spectrum.jacobian_column_by_direction(I, p), (shape, p)
+            assert ntt_spectrum.jacobian_column_ntt(I, p) == want, (shape, p)
+        if shape[0] <= 8:
+            for p in np.ndindex(shape):
+                assert ntt_spectrum.jacobian_column_ntt(I, p) == \
+                    definition.jacobian_column(I, p), (shape, p)
+
+
+def test_the_dispatcher_takes_each_path_on_the_side_it_is_faster_on():
+    """The threshold has to be where the measured crossover is, not somewhere.
+
+    Only the side each shape takes is asserted; the timings behind them are in
+    the note on _COLUMN_GROUPED_MIN_OFFSETS. The two images differ only in size,
+    so this is what stops the threshold drifting into a range where the grouped
+    path is being asked to do a job it is slower at.
+    """
+    small = np.ones((16, 16), dtype=np.int64)      # grouped loses 0.56x here
+    large = np.ones((32, 32), dtype=np.int64)      # grouped gains 1.57x here
+    taken = []
+    real = ntt_spectrum.jacobian_column_by_direction
+    ntt_spectrum.jacobian_column_by_direction = \
+        lambda *a, **k: taken.append(a[0].size) or real(*a, **k)
+    try:
+        ntt_spectrum.jacobian_column_ntt(small, (0, 0))
+        assert taken == [], "the grouped path ran below the measured crossover"
+        ntt_spectrum.jacobian_column_ntt(large, (0, 0))
+        assert taken == [large.size], "the grouped path did not run above it"
+    finally:
+        ntt_spectrum.jacobian_column_by_direction = real
+
+
+def test_a_column_step_moves_the_spectrum_by_exactly_the_column():
+    """The descent's contract: area_spectrum(I + s*e_p) == A(I) + s*C, exactly.
+
+    This is the identity the column exists for -- descent._step_spectrum adds
+    the column to the spectrum instead of recomputing it -- and it is exact
+    integer arithmetic, so a column that was right only to within a rounding
+    would drift here without raising anything.
+    """
+    rng = np.random.default_rng(20260932)
+    for shape in [(4, 4), (5, 6), (7, 4)]:
+        I = rng.integers(0, 5, size=shape).astype(np.int64)
+        base = area_spectrum(I)
+        for p in np.ndindex(shape):
+            column = ntt_spectrum.jacobian_column_ntt(I, p)
+            for step in (1, -1, 5):
+                J = I.copy()
+                J[p] += step
+                assert area_spectrum(J) == \
+                    [b + step * c for b, c in zip(base, column)], (shape, p, step)
+
+
+def test_the_column_still_rejects_what_it_rejected_before():
+    """The three guards, through the dispatcher and through each path.
+
+    The guards used to sit in the one column function and now sit in the
+    geometry both paths share, so a path that bypassed them would wrap
+    silently and corrupt the spectrum the step is added to -- which is why each
+    is checked on each entry point rather than on the dispatcher alone.
+    """
+    too_big = np.full((3, 3), 2 ** 60, dtype=np.int64)
+    ragged = np.ones((3, 4), dtype=np.int64)
+    negative = np.ones((3, 3), dtype=np.int64)
+    negative[0, 0] = -1
+    for fn in (ntt_spectrum.jacobian_column_ntt,
+               ntt_spectrum.jacobian_column_chunked,
+               ntt_spectrum.jacobian_column_by_direction):
+        with pytest.raises(ValueError, match="exceed int64"):
+            fn(too_big, (1, 1))
+        with pytest.raises(ValueError, match="not a coordinate"):
+            fn(ragged, (0, 4))
+        with pytest.raises(ValueError):
+            fn(negative, (1, 1))
+        with pytest.raises(UnsupportedDimension):
+            fn(np.ones((2, 2, 2), dtype=np.int64), (0, 0, 0))
+
+
+@pytest.mark.parametrize("max_value", [None, 3, 5, 200])
+def test_the_column_takes_max_value_and_ignores_it(max_value):
+    """max_value sizes the modulus set on the CRT paths and is unread here.
+
+    The column is summed on int64 against a bound taken from the image itself,
+    so the argument is accepted for signature compatibility and must not change
+    the answer. Passing one is how a caller written for the spectrum would
+    naturally call the column.
+    """
+    rng = np.random.default_rng(20260934)
+    I = rng.integers(0, 5, size=(5, 4)).astype(np.int64)
+    p = (2, 1)
+    want = definition.jacobian_column(I, p)
+    for fn in (ntt_spectrum.jacobian_column_ntt,
+               ntt_spectrum.jacobian_column_chunked,
+               ntt_spectrum.jacobian_column_by_direction):
+        assert fn(I, p, max_value) == want, (fn.__name__, max_value)
+
+
+# ---------------------------------------------------------------------------
 # the halved offset loop
 # ---------------------------------------------------------------------------
 
