@@ -21,6 +21,7 @@ from descent import (
     ReferenceBackend,
     descent as run_descent,
     integer_gradient_direction,
+    iter_descent,
     ranked_gradient_steps,
     spectrum_loss,
 )
@@ -33,6 +34,7 @@ SPEC_GRADIENT = spectrum_gradient
 LOSS = spectrum_loss
 DIRECTION = integer_gradient_direction
 DESCENT = run_descent
+ITER = iter_descent
 
 
 def _reference_rows(I):
@@ -423,6 +425,169 @@ def test_descent_default_scale_is_row_sums():
     I = rng.integers(0, 6, size=(3, 3)).astype(np.int64)
     target = AREA_SPECTRUM(rng.integers(0, 6, size=(3, 3)).astype(np.int64))
     assert DESCENT(I, target).image.tolist() == DESCENT(I, target, ROW_SUMS(I)).image.tolist()
+
+
+# ---------------------------------------------------------------------------
+# iter_descent
+# ---------------------------------------------------------------------------
+
+def test_iter_descent_is_descent_drained():
+    """The generator and the blocking form are one implementation, so they agree.
+
+    Checked across the seeds and the stopping reasons that matter, because
+    descent() is now literally this generator drained and a disagreement would
+    mean the two had drifted after all.
+    """
+    for seed in range(8):
+        rng = np.random.default_rng(seed)
+        shape = (3, 3) if seed % 2 else (4, 4)
+        I = rng.integers(0, 6, size=shape).astype(np.int64)
+        scale = ROW_SUMS(I)
+        target = AREA_SPECTRUM(rng.integers(0, 6, size=shape).astype(np.int64))
+        for patience in (1, 25):
+            for max_steps in (1, 5, 200):
+                kwargs = dict(scale=scale, max_steps=max_steps, patience=patience)
+                streamed = list(ITER(I, target, **kwargs))[-1]
+                blocked = DESCENT(I, target, **kwargs)
+                assert streamed.image.tolist() == blocked.image.tolist(), (seed, patience, max_steps)
+                assert streamed.loss == blocked.loss
+                assert streamed.accepted_steps == blocked.accepted_steps
+                assert streamed.history == blocked.history
+                assert streamed.stopped_early == blocked.stopped_early
+
+
+def test_iter_descent_yields_before_it_steps():
+    """The first snapshot is the starting point, before any step is tried.
+
+    A progress display needs the starting loss and the step count to draw
+    anything at all, and a caller that has to run a step to get one cannot
+    show a run that is refused, or a target it is already at.
+    """
+    rng = np.random.default_rng(151)
+    I = rng.integers(0, 6, size=(3, 3)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    first = next(ITER(I, AREA_SPECTRUM(I), scale, max_steps=10, patience=10))
+    assert first.accepted_steps == 0
+    assert first.loss == 0.0
+    assert first.history == [0.0]
+    assert first.stopped_early is False
+    assert (first.image == I).all()
+
+
+def test_iter_descent_yields_a_snapshot_per_accepted_step():
+    """One snapshot per accepted step, and never a step without one.
+
+    The final patience snapshot repeats the last accepted one, since patience
+    costs no step: it is the same state reported a second way. So the count is
+    the step count plus one, plus one more if the run ended on patience -- and
+    every yield but that last one advances the count by exactly one.
+    """
+    rng = np.random.default_rng(157)
+    I = rng.integers(1, 6, size=(4, 4)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(rng.integers(0, 6, size=(4, 4)).astype(np.int64))
+    snapshots = list(ITER(I, target, scale, max_steps=300, patience=25, width=8))
+    steps = [s.accepted_steps for s in snapshots]
+    assert steps[0] == 0
+    assert all(b - a in (0, 1) for a, b in zip(steps, steps[1:])), steps
+    assert steps[-1] == snapshots[-1].accepted_steps
+    repeated = [i for i, (a, b) in enumerate(zip(steps, steps[1:]), 1) if b == a]
+    # The only step that does not advance is the patience repeat, and it can
+    # only be the last yield.
+    assert repeated == ([len(steps) - 1] if snapshots[-1].stopped_early else []), steps
+    assert len(snapshots) == snapshots[-1].accepted_steps + 1 + bool(repeated)
+
+
+def test_iter_descent_grows_its_history_a_step_at_a_time():
+    # A caller drawing a curve reads the history off each snapshot, so it has to
+    # be the history *so far* and not the finished run: a snapshot that already
+    # knew the end would draw a curve that moves before anything happened.
+    rng = np.random.default_rng(163)
+    I = rng.integers(1, 6, size=(4, 4)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(rng.integers(0, 6, size=(4, 4)).astype(np.int64))
+    snapshots = list(ITER(I, target, scale, max_steps=200, patience=25, width=8))
+    assert len(snapshots) > 2
+    for earlier, later in zip(snapshots, snapshots[1:]):
+        assert later.history[:len(earlier.history)] == earlier.history
+        assert len(later.history) in (len(earlier.history), len(earlier.history) + 1)
+    # The curve strictly falls for every step that was accepted.
+    for earlier, later in zip(snapshots, snapshots[1:]):
+        if len(later.history) > len(earlier.history):
+            assert later.loss < earlier.loss
+
+
+def test_iter_descent_snapshots_are_independent_copies():
+    """Every snapshot is a copy, so holding one shows the run as it was.
+
+    Not a nicety: a caller that keeps the last snapshot to draw while the run
+    continues would otherwise be watching the search's own working array, and
+    the image it drew last frame would silently change under it.
+    """
+    rng = np.random.default_rng(167)
+    I = rng.integers(1, 6, size=(4, 4)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(rng.integers(0, 6, size=(4, 4)).astype(np.int64))
+    snapshots = list(ITER(I, target, scale, max_steps=200, patience=25, width=8))
+    assert len(snapshots) > 1
+    first = snapshots[0].image
+    for later in snapshots[1:]:
+        assert later.image is not first
+    assert (first == I).all()
+    assert not (snapshots[-1].image == I).all()
+
+
+def test_iter_descent_stopping_early_cancels_the_run():
+    """Cancelling is the absence of the next value, and it is not patience.
+
+    The two have to stay distinct facts: patience is the search reporting it is
+    stuck, and a cancellation is the caller losing interest. A summary that
+    conflated them would claim a run found a minimum when the user walked away
+    from it.
+    """
+    rng = np.random.default_rng(173)
+    I = rng.integers(1, 6, size=(4, 4)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(rng.integers(0, 6, size=(4, 4)).astype(np.int64))
+    run = ITER(I, target, scale, max_steps=1000, patience=1000)
+    taken = [next(run) for _ in range(4)]
+    assert taken[-1].stopped_early is False
+    run.close()
+    # Closed, not drained: the image at the moment of cancellation is the state,
+    # and the generator reports nothing about stopping early.
+    assert taken[-1].accepted_steps <= 1000
+
+
+def test_iter_descent_reports_patience_on_its_last_snapshot():
+    rng = np.random.default_rng(179)
+    I = rng.integers(0, 6, size=(3, 3)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(rng.integers(0, 6, size=(3, 3)).astype(np.int64))
+    snapshots = list(ITER(I, target, scale, max_steps=1000, patience=1))
+    assert snapshots[-1].stopped_early is True
+    assert all(not s.stopped_early for s in snapshots[:-1])
+
+
+def test_iter_descent_does_not_mutate_input():
+    rng = np.random.default_rng(181)
+    I = rng.integers(0, 6, size=(3, 3)).astype(np.int64)
+    before = I.copy()
+    for _ in ITER(I, AREA_SPECTRUM(np.ones((3, 3), dtype=np.int64)), ROW_SUMS(I),
+                  max_steps=20):
+        pass
+    assert (I == before).all()
+
+
+def test_iter_descent_works_with_the_ntt_backend():
+    ntt_spectrum = pytest.importorskip("ntt_spectrum")
+    rng = np.random.default_rng(191)
+    I = rng.integers(1, 6, size=(4, 4)).astype(np.int64)
+    scale = ROW_SUMS(I)
+    target = AREA_SPECTRUM(rng.integers(0, 6, size=(4, 4)).astype(np.int64))
+    kwargs = dict(scale=scale, max_steps=100, patience=25)
+    fast = list(ITER(I, target, backend=ntt_spectrum.NTTBackend(), **kwargs))[-1]
+    ref = list(ITER(I, target, **kwargs))[-1]
+    assert fast.image.tolist() == ref.image.tolist()
 
 
 # ---------------------------------------------------------------------------

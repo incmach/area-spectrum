@@ -266,6 +266,89 @@ def integer_gradient_direction(I, target, scale, min_value=0, max_value=255,
 Descent = namedtuple("Descent", "image loss accepted_steps history stopped_early")
 
 
+def iter_descent(I, target, scale=None, max_steps=1000, patience=25,
+                 min_value=0, max_value=255, width=1, backend=None):
+    """descent, yielding a snapshot of the run after every step.
+
+    Yields a Descent once before the first step and once after every accepted
+    step, so a caller that is drawing progress can read the running loss, the
+    accepted-step count and the history as the run proceeds rather than waiting
+    for a result it only sees at the end.     The last value yielded is the result,
+    and the generator then returns.
+
+    Yields a snapshot per accepted step, plus one more if patience runs out.
+    That last one repeats the previous state rather than advancing, because
+    patience costs no step: it is the same image reported a second way, saying
+    why the run stopped. A caller counting yields therefore gets
+    accepted_steps + 1, or + 2 if the run ended on patience.
+
+    Each yielded image is a copy of the working image at that point, so a caller
+    may hold on to a snapshot; the search keeps mutating its own.
+
+    Cancelling a run is done by not asking for the next value. Nothing in the
+    search needs to know, and the last snapshot is the state at the moment of
+    cancellation. That is deliberately *not* the same thing as stopped_early,
+    which means patience ran out and is reported by the generator itself -- a
+    target can be attainable and still missed this way, which is a different
+    fact from a user losing interest, and a caller showing a summary needs to
+    keep them apart.
+
+    descent() is this generator drained to its last value, so the search has
+    one implementation rather than two that can drift apart.
+    """
+    backend = _resolve(backend)
+    # The pixel range the search will stay inside, offered to the backend as a
+    # value bound. A backend that picks CRT primes from the dtype alone is
+    # charged for int64's 2**63 and pays for it in passes; the bound is exact
+    # because the true values are inside it, and the steps are clamped to it
+    # anyway, so the assumption is enforced by construction and not merely
+    # expected. None disables it, leaving the backend to its own default.
+    value_bound = max_value if max_value is not None else None
+    if scale is None:
+        scale = _with_max_value(backend.jacobian_row_sums, backend, (I,), value_bound)
+    current = np.array(I, dtype=np.int64, copy=True)
+    # The spectrum of the current image, kept in hand for the whole run. The
+    # spectrum is trilinear, so a one-pixel step moves it by exactly the
+    # Jacobian column at that pixel: the next spectrum is this one plus the
+    # step's column, an exact integer either way. Carrying it forward is what
+    # turns one spectrum per candidate into one spectrum per run, and it stays
+    # exact over an arbitrary number of steps because every step adds integers.
+    spectrum = backend.area_spectrum(current)
+    loss = spectrum_residual_loss(spectrum, target, scale)
+    history = [loss]
+    accepted = 0
+    stalled = 0
+    yield Descent(current.copy(), loss, accepted, list(history), False)
+    for _ in range(max_steps):
+        candidates = ranked_gradient_steps(
+            current, target, scale, min_value, max_value, backend, spectrum
+        )
+        best = None
+        best_move = None
+        for pixel, step in candidates[:width]:
+            trial_spectrum = _step_spectrum(spectrum, current, pixel, step, backend)
+            trial_loss = spectrum_residual_loss(trial_spectrum, target, scale)
+            if trial_loss < loss and (best is None or trial_loss < best[0]):
+                best = (trial_loss, trial_spectrum)
+                best_move = (pixel, step)
+        if best is None:
+            stalled += 1
+            if stalled >= patience:
+                yield Descent(current.copy(), loss, accepted, list(history), True)
+                return
+            continue
+        loss, spectrum = best
+        # Replay the accepted move on the image itself. The spectrum carried
+        # forward is the same one the trial was scored from, so the two cannot
+        # disagree about which pixel moved -- but the image is the thing
+        # returned, and it is derived here rather than carried alongside.
+        current[best_move[0]] += best_move[1]
+        accepted += 1
+        stalled = 0
+        history.append(loss)
+        yield Descent(current.copy(), loss, accepted, list(history), False)
+
+
 def descent(I, target, scale=None, max_steps=1000, patience=25,
             min_value=0, max_value=255, width=1, backend=None):
     """Reduce the discrepancy between the image's spectrum and a fixed target,
@@ -289,8 +372,8 @@ def descent(I, target, scale=None, max_steps=1000, patience=25,
     A candidate is scored by its exact loss, not an estimate: the spectrum of a
     one-pixel step is the current spectrum plus the step's Jacobian column, which
     is the identity rather than a first-order approximation, so scoring it costs
-    a column and not a spectrum. The spectrum is therefore computed once for the
-    run and carried forward a column at a time, instead of once per candidate.
+    a column and not a spectrum. The spectrum is therefore computed once for
+    the run and carried forward a column at a time, instead of once per candidate.
 
     What that changes is where the exactness of a step's score comes from. It
     used to come from measuring each trial image's spectrum with an independent
@@ -316,53 +399,14 @@ def descent(I, target, scale=None, max_steps=1000, patience=25,
     across steps. backend defaults to the reference implementation in
     definition.py. Returns a Descent with the final image, its loss, the number
     of steps accepted, the loss history, and whether patience ran out.
+
+    This blocks until the run is over. A caller that wants to watch a run, or to
+    cancel one, should drive iter_descent instead, which yields the same
+    snapshots and stops when the caller stops asking.
     """
-    backend = _resolve(backend)
-    # The pixel range the search will stay inside, offered to the backend as a
-    # value bound. A backend that picks CRT primes from the dtype alone is
-    # charged for int64's 2**63 and pays for it in passes; the bound is exact
-    # because the true values are inside it, and the steps are clamped to it
-    # anyway, so the assumption is enforced by construction and not merely
-    # expected. None disables it, leaving the backend to its own default.
-    value_bound = max_value if max_value is not None else None
-    if scale is None:
-        scale = _with_max_value(backend.jacobian_row_sums, backend, (I,), value_bound)
-    current = np.array(I, dtype=np.int64, copy=True)
-    # The spectrum of the current image, kept in hand for the whole run. The
-    # spectrum is trilinear, so a one-pixel step moves it by exactly the
-    # Jacobian column at that pixel: the next spectrum is this one plus the
-    # step's column, an exact integer either way. Carrying it forward is what
-    # turns one spectrum per candidate into one spectrum per run, and it stays
-    # exact over an arbitrary number of steps because every step adds integers.
-    spectrum = backend.area_spectrum(current)
-    loss = spectrum_residual_loss(spectrum, target, scale)
-    history = [loss]
-    accepted = 0
-    stalled = 0
-    for _ in range(max_steps):
-        candidates = ranked_gradient_steps(
-            current, target, scale, min_value, max_value, backend, spectrum
-        )
-        best = None
-        best_move = None
-        for pixel, step in candidates[:width]:
-            trial_spectrum = _step_spectrum(spectrum, current, pixel, step, backend)
-            trial_loss = spectrum_residual_loss(trial_spectrum, target, scale)
-            if trial_loss < loss and (best is None or trial_loss < best[0]):
-                best = (trial_loss, trial_spectrum)
-                best_move = (pixel, step)
-        if best is None:
-            stalled += 1
-            if stalled >= patience:
-                return Descent(current, loss, accepted, history, True)
-            continue
-        loss, spectrum = best
-        # Replay the accepted move on the image itself. The spectrum carried
-        # forward is the same one the trial was scored from, so the two cannot
-        # disagree about which pixel moved -- but the image is the thing
-        # returned, and it is derived here rather than carried alongside.
-        current[best_move[0]] += best_move[1]
-        accepted += 1
-        stalled = 0
-        history.append(loss)
-    return Descent(current, loss, accepted, history, False)
+    final = None
+    for final in iter_descent(I, target, scale, max_steps, patience,
+                              min_value, max_value, width, backend):
+        pass
+    return final
+
